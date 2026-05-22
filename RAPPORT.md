@@ -435,26 +435,79 @@ Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run te
 
 ### 5.3 Résultats
 
+Après les 3 correctifs ci-dessus, le pipeline s'exécute entièrement : les jobs **test**, **security** et **docker** passent au vert sur la branche `preProd`. Le job **deploy** ne s'exécute pas (réservé à `master`), ce qui est le comportement attendu pour cette étape.
+
 > *(Capture à insérer : onglet GitHub Actions avec les jobs test, security, docker en vert)*
 
 ---
 
 ## ÉTAPE 6 — Déploiement Azure for Students
 
-> *(Sections à compléter après le déploiement)*
+**URL publique de l'application déployée : https://helpdesk-mks.azurewebsites.net**
 
-### 6.1 Ressources créées
+### 6.1 Installation d'Azure CLI
 
-| Ressource | Nom | SKU |
-|-----------|-----|-----|
-| Resource Group | `helpdesk-rg` | N/A |
-| Container Registry | `helpdesk-acr<initiales>` | Basic |
+Azure CLI n'a pas pu être installé via le script officiel `InstallAzureCLIDeb` : le poste tourne sous **Ubuntu 25.10 « Questing »**, une version trop récente pour laquelle Microsoft n'a pas encore publié de paquet apt (le dépôt renvoie `404`). Contournement utilisé : installation dans un environnement Python isolé (`python3 -m venv` + `pip install azure-cli`), méthode d'installation officiellement supportée. Azure CLI 2.86.0 a ainsi été installé sans `sudo`.
+
+### 6.2 Ressources créées
+
+| Ressource | Nom | SKU / Détail |
+|-----------|-----|--------------|
+| Resource Group | `helpdesk-rg` | région `francecentral` |
+| Container Registry | `helpdeskacrmks` | Basic — `helpdeskacrmks.azurecr.io` |
 | App Service Plan | `helpdesk-plan` | B1 (Linux) |
-| Web App | `helpdesk-<initiales>` | — |
+| Web App | `helpdesk-mks` | conteneur Linux |
+
+**Obstacle rencontré :** sur une souscription neuve, les *resource providers* `Microsoft.ContainerRegistry` et `Microsoft.Web` ne sont pas activés. La création de l'ACR échouait avec `MissingSubscriptionRegistration`. Résolu par `az provider register --namespace Microsoft.ContainerRegistry` (et `Microsoft.Web`).
+
+### 6.3 Push de l'image vers ACR
+
+```bash
+docker tag helpdesk:dev helpdeskacrmks.azurecr.io/helpdesk:v1
+docker push helpdeskacrmks.azurecr.io/helpdesk:v1
+```
+
+L'image a été poussée avec le tag `v1` après authentification (`docker login` avec les credentials admin de l'ACR).
+
+### 6.4 Création de la Web App
+
+**Obstacle rencontré :** avec les flags récents d'`az webapp create`, passer `--container-image-name` *avec* le host du registre **et** `--container-registry-url` aboutit à un double préfixe (`helpdeskacrmks.azurecr.io/helpdeskacrmks.azurecr.io/helpdesk:v1`). À l'inverse, `az webapp config container set` ne préfixe **pas** : il faut lui passer le chemin **complet**. Configuration finale correcte :
+
+```
+linuxFxVersion = DOCKER|helpdeskacrmks.azurecr.io/helpdesk:v1
+```
+
+Variables d'environnement définies (`az webapp config appsettings set`) :
+
+| Variable | Valeur | Rôle |
+|----------|--------|------|
+| `DATABASE_URL` | `file:/app/data/prod.db` | Emplacement de la base SQLite |
+| `JWT_SECRET` | (généré par `openssl rand -base64 32`) | Secret de signature JWT — fort, 256 bits |
+| `NODE_ENV` | `production` | Mode production |
+| `WEBSITES_PORT` | `3000` | Indique à Azure le port exposé par le conteneur |
+
+### 6.5 Initialisation de la base de données
+
+Le TP prévoyait d'initialiser la base via SSH (`az webapp ssh` puis `npx prisma migrate deploy`). **Cette approche ne fonctionne pas ici** : l'image standalone ne contient ni le CLI Prisma ni `tsx`, et `npx prisma` télécharge alors Prisma 7 qui rejette le schéma écrit pour Prisma 5.
+
+**Solution retenue :** la base est créée et seedée **pendant le build Docker**, dans le stage `builder` (qui dispose, lui, du CLI Prisma 5 et de `tsx` via les devDependencies). La base SQLite pré-remplie (3 utilisateurs : admin / agent / user) est ensuite copiée dans l'image finale à `/app/data/prod.db`. L'application est donc opérationnelle dès le démarrage du conteneur, sans étape manuelle.
+
+*Limite assumée :* la base étant embarquée dans l'image, elle revient à son état seedé à chaque redéploiement. Pour une vraie persistance, il faudrait une base externe (cf. synthèse — migration PostgreSQL).
 
 ### 6.6 Validation
 
-> *(Captures à insérer : `curl https://<url>.azurewebsites.net/api/health` + navigateur avec dashboard)*
+```
+$ curl https://helpdesk-mks.azurewebsites.net/api/health
+{"status":"ok","timestamp":"2026-05-22T14:33:46.232Z","uptime":7.0}
+
+$ curl -X POST https://helpdesk-mks.azurewebsites.net/api/auth/login \
+    -d '{"email":"admin@helpdesk.io","password":"Password123!"}'
+→ connexion réussie, role: ADMIN (Alice Admin)
+```
+
+Les 6 headers de sécurité (middleware) sont également présents sur la réponse HTTPS. L'application est accessible publiquement et fonctionnelle.
+
+> *(Captures à insérer : `curl .../api/health` + navigateur sur https://helpdesk-mks.azurewebsites.net avec le dashboard connecté)*
 
 ---
 
@@ -466,7 +519,7 @@ Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run te
  ┌──────────────────────────────────────────────────────────────────────┐
  │  Développeur local                                                    │
  │                                                                      │
- │  Code source  →  git push  →  GitHub (main branch)                  │
+ │  Code source  →  git push  →  GitHub (branches master / preProd)     │
  └─────────────────────────────┬────────────────────────────────────────┘
                                 │ déclenche
                                 ▼
@@ -476,20 +529,21 @@ Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run te
  │  [test] lint + unit tests + coverage                                 │
  │  [security] npm audit + Trivy scan                                   │
  │  [docker] build image Docker + scan image                            │
- │  [deploy] push ACR + deploy App Service                              │
+ │  [deploy] push ACR + deploy App Service  (sur master uniquement)     │
  └──────────────────────────────┬───────────────────────────────────────┘
                                  │
                ┌─────────────────┴──────────────────┐
                ▼                                    ▼
  ┌─────────────────────────┐          ┌──────────────────────────────┐
  │  Azure Container        │          │  Azure App Service            │
- │  Registry (ACR)         │ ─pull──▶ │  helpdesk-<initiales>         │
- │  helpdesk:v1.2.3        │          │  (container Linux)            │
+ │  Registry (ACR)         │ ─pull──▶ │  helpdesk-mks                 │
+ │  helpdeskacrmks         │          │  (container Linux, plan B1)   │
+ │  helpdesk:v1            │          │                               │
  └─────────────────────────┘          └──────────────────────────────┘
                                                    │
                                                    ▼
-                                      https://<nom>.azurewebsites.net
-                                           (accès public)
+                          https://helpdesk-mks.azurewebsites.net
+                                       (accès public)
 ```
 
 ### 3 améliorations DevSecOps prioritaires
@@ -505,10 +559,20 @@ Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run te
 
 ### Coût Azure estimé
 
-> *(À compléter après déploiement : coût dans Azure Cost Management)*
-> 
-> Estimation : ACR Basic (~5$/mois) + App Service B1 (~13$/mois) = **~18$/mois**. Avec 100$ de crédit étudiant, cela couvre 5 mois.
+Deux ressources facturées : **ACR Basic** (~5 $/mois) + **App Service Plan B1** (~13 $/mois) = **~18 $/mois**. Le resource group et la Web App ne coûtent rien en eux-mêmes (la facturation se fait sur le plan). Sur les 100 $ de crédit Azure for Students, le déploiement couvre donc environ **5 mois**. Le déploiement de ce TP, sur quelques heures, n'entame le crédit que de quelques centimes.
+
+> *(Capture à insérer : Azure Cost Management — coût réel constaté)*
 
 ### Ce qui a posé problème
 
-> *(À compléter avec les obstacles rencontrés et les solutions trouvées)*
+| Problème | Cause | Solution |
+|----------|-------|----------|
+| Conteneur `unhealthy` en local | `localhost` résout en IPv6 dans le conteneur, le serveur Next.js n'écoute qu'en IPv4 | `localhost` → `127.0.0.1` dans le healthcheck |
+| Login impossible en conteneur | Connexion Prisma mise en cache avant l'arrivée de la base | Redémarrer le conteneur après l'init de la base |
+| `next lint` bloquant en CI | Aucune config ESLint → commande interactive | Ajout de `.eslintrc.json` |
+| Workflow CI jamais déclenché | Le workflow écoutait `main`/`develop`, dépôt sur `master`/`preProd` | Correction des branches du déclencheur |
+| Job `docker` : image introuvable par Trivy | Buildx ne charge pas l'image dans le démon Docker | Ajout de `load: true` |
+| Azure : `MissingSubscriptionRegistration` | Resource providers non activés sur une souscription neuve | `az provider register` (ContainerRegistry, Web) |
+| Azure : image au mauvais chemin | Double préfixe du registre par `az webapp create` | Chemin d'image complet via `az webapp config container set` |
+| Azure : base de données non initialisable | L'image standalone n'a ni le CLI Prisma ni `tsx` | Base SQLite seedée pendant le build, embarquée dans l'image |
+| Azure CLI non installable | Ubuntu 25.10 trop récent, pas de paquet Microsoft | Installation via `pip` dans un venv Python |
