@@ -136,10 +136,14 @@ Deux fichiers étaient fournis (`auth.test.ts`, `validators.test.ts`). J'ai cré
 
 ## ÉTAPE 3 — Tests de montée en charge k6
 
+> Remarque : l'application tourne dans le conteneur Docker exposé sur le port **3004**
+> (le port 3000 étant occupé par un autre service local). Les tests k6 sont donc
+> lancés avec `-e BASE_URL=http://localhost:3004`.
+
 ### 3.1 Smoke test
 
 ```bash
-k6 run k6/smoke-test.js
+k6 run -e BASE_URL=http://localhost:3004 k6/smoke-test.js
 ```
 
 **Ce que mesure ce test :**
@@ -147,12 +151,22 @@ k6 run k6/smoke-test.js
 - Appelle `/api/health` en continu
 - Seuils : 95% des requêtes < 200ms, taux d'erreur < 1%
 
+**Résultats :**
+
+| Métrique | Valeur | Seuil | Verdict |
+|----------|--------|-------|---------|
+| p(95) latence | 6.19 ms | < 200 ms | ✓ |
+| Taux d'erreur | 0.00% | < 1% | ✓ |
+| Requêtes | 2 499 (~250 req/s) | — | 100% OK |
+
+Le smoke test confirme que l'app répond correctement à faible charge avant de lancer le test lourd.
+
 > *(Capture à insérer : résumé console k6)*
 
 ### 3.2 Test de charge
 
 ```bash
-k6 run k6/load-test.js
+k6 run -e BASE_URL=http://localhost:3004 k6/load-test.js
 ```
 
 **Scénario de montée :**
@@ -166,7 +180,33 @@ k6 run k6/load-test.js
 - **RPS** (Requests Per Second) : débit — combien de requêtes par seconde le serveur traite
 - **Taux d'erreur** : % de requêtes ayant échoué (HTTP 4xx/5xx ou timeout)
 
-> *(Captures à insérer : résumé console + fichier k6-summary.json)*
+**Résultats :**
+
+| Métrique | Valeur | Seuil | Verdict |
+|----------|--------|-------|---------|
+| Requêtes totales | 6 253 | — | — |
+| Débit (RPS) | 25.9 req/s | — | — |
+| Taux d'erreur | 0.00% | < 1% | ✓ |
+| Checks réussis | 8 336 / 8 336 | — | ✓ |
+| Latence médiane | 811 ms | — | — |
+| Latence moyenne | 1 071 ms | — | — |
+| **p(95) latence** | **3 176 ms** | < 500 ms | **✗** |
+| Latence max | 7 485 ms | — | — |
+| p(95) route `/api/tickets` (GET) | 3 999 ms | — | route la plus lente |
+
+**Interprétation :** le seuil `p(95) < 500 ms` est dépassé, donc k6 termine avec le code de sortie 99 et affiche `thresholds on metrics 'http_req_duration' have been crossed`. **C'est le résultat attendu et utile** : le but d'un test de charge est de révéler la limite de l'application. Le test lui-même s'est déroulé sans incident — ce message n'est pas une panne.
+
+L'app reste **fonctionnellement correcte** sous charge (0% d'erreur, aucun crash, aucun 5xx, 8 336 checks réussis), mais elle devient **lente** : la latence p(95) passe de **6 ms** (smoke, 1 VU) à **3 176 ms** (charge, 50 VUs), soit une dégradation d'un facteur ~500.
+
+**Deux goulots d'étranglement identifiés :**
+
+1. **SQLite est mono-écriture.** Chaque création de ticket prend un verrou exclusif sur le fichier de base. Avec 50 VUs créant des tickets en parallèle, les écritures se sérialisent et forment une file d'attente.
+
+2. **`GET /api/tickets` n'a aucune pagination** (`src/app/api/tickets/route.ts` — `findMany()` sans `take`/`skip`). Le test a créé ~2 084 tickets. À chaque appel, la requête renvoie *tous* les tickets, chacun enrichi de 3 jointures (auteur, assigné, nombre de commentaires). Plus le test avance, plus le jeu de résultats grossit — d'où le p(95) de ~4 s sur cette route.
+
+**Pistes de correction :** ajouter une pagination (`take: 20, skip: …`) sur la liste des tickets, et migrer SQLite → PostgreSQL pour gérer les écritures concurrentes.
+
+> *(Captures à insérer : résumé console + fichier k6-summary.json — généré à la racine du projet)*
 
 ### 3.3 Test de rupture (bonus — 200 VUs)
 
