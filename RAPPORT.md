@@ -395,7 +395,7 @@ Pendant la phase de tests, le conteneur Docker apparaissait en statut `unhealthy
 Le fichier `.github/workflows/ci-cd.yml` définit 4 jobs exécutés dans l'ordre :
 
 ```
-push → main/develop
+push → master/preProd
          │
          ▼
     ┌─────────┐    ┌──────────┐
@@ -409,7 +409,7 @@ push → main/develop
            └────┬───┘
                 ▼
            ┌────────┐
-           │ deploy │   (uniquement sur main, nécessite docker ✓)
+           │ deploy │   (uniquement sur master, nécessite docker ✓)
            └────────┘
 ```
 
@@ -419,9 +419,19 @@ push → main/develop
 
 **Job `docker` :** build l'image Docker avec cache GitHub Actions (pour accélérer les builds suivants), scan Trivy de l'image construite.
 
-**Job `deploy` :** conditionné à `github.ref == 'refs/heads/main'` (uniquement sur la branche principale) + tous les secrets Azure configurés.
+**Job `deploy` :** conditionné à `github.ref == 'refs/heads/master'` (uniquement sur la branche principale) + tous les secrets Azure configurés.
 
-### 5.2 Résultats
+### 5.2 Corrections nécessaires avant exécution
+
+Deux ajustements ont été indispensables pour que le pipeline puisse s'exécuter :
+
+1. **Branches de déclenchement.** Le workflow fourni écoutait `main`/`develop`, or ce dépôt utilise `master` (branche principale) et `preProd` (branche de travail). Sans correction, un `git push` ne déclenchait **aucun** job. Le déclencheur a été changé en `[master, preProd]`, et la condition du job `deploy` en `refs/heads/master`.
+
+2. **Configuration ESLint manquante.** Le projet n'avait aucun fichier `.eslintrc`. La commande `npm run lint` (`next lint`) devenait alors **interactive** (elle demandait de choisir une config) — ce qui bloque en CI puisqu'aucune entrée clavier n'est possible. Un fichier `.eslintrc.json` (`extends: next/core-web-vitals`) a été ajouté. Résultat : `npm run lint` se termine avec le code 0 (3 warnings, 0 erreur).
+
+Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run test:coverage` → 57 tests OK ✓ · `npm run build` → build réussi ✓.
+
+### 5.3 Résultats
 
 > *(Capture à insérer : onglet GitHub Actions avec les jobs test, security, docker en vert)*
 
