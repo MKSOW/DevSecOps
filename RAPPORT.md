@@ -223,7 +223,20 @@ npm audit
 npm audit --audit-level=high
 ```
 
-> *(Captures à insérer : résultat npm audit)*
+**Résultats :** 11 vulnérabilités au total.
+
+| Sévérité | Nombre |
+|----------|--------|
+| Critique | 0 |
+| Haute | 4 |
+| Modérée | 7 |
+| Basse | 0 |
+
+**Paquets touchés en sévérité haute :** `next`, `eslint-config-next`, `@next/eslint-plugin-next`, `glob`. Les vulnérabilités modérées concernent surtout des dépendances de développement (`vitest`, `vite`, `esbuild`, `postcss`).
+
+La principale faille vient de `next` lui-même (version 14.2.33) : plusieurs avis de sécurité (DoS sur Server Components, cache poisoning, SSRF via WebSocket…). Le correctif complet impose `next@16`, un changement majeur (breaking change). En contexte réel on planifierait cette montée de version, sans `npm audit fix --force` à l'aveugle qui casserait le build.
+
+> *(Capture à insérer : sortie console npm audit)*
 
 ### 4.2 Scan Trivy
 
@@ -231,28 +244,41 @@ npm audit --audit-level=high
 trivy image helpdesk:dev --severity HIGH,CRITICAL
 ```
 
-> *(Captures à insérer : résultat Trivy)*
+**Résultats :**
 
-**Pourquoi scanner l'image ?** L'image Docker est construite sur `node:20-alpine`. Alpine Linux contient des paquets système (openssl, libc, etc.) qui peuvent avoir des CVE (vulnérabilités connues). Trivy compare la liste des paquets installés avec la base de données NVD (National Vulnerability Database) et signale les failles connues.
+| Couche scannée | CRITICAL | HIGH |
+|----------------|----------|------|
+| OS Alpine (paquets système) | 0 | 0 |
+| Paquets Node.js (dépendances app) | 0 | 18 |
+
+**Observation clé :** la couche système (Alpine Linux) est **totalement propre** — 0 vulnérabilité HIGH/CRITICAL. Les 18 failles hautes sont **toutes** dans les dépendances npm embarquées dans l'image (`next`, `tar`…). Choisir `node:20-alpine` comme image de base était donc un bon choix sécurité : Alpine est minimaliste et contient très peu de paquets système exploitables. Le risque résiduel est entièrement dans le code applicatif — c'est cohérent avec le résultat de `npm audit`.
+
+**Pourquoi scanner l'image ?** Une image Docker empile deux sources de risque : (1) les paquets système de l'OS de base, (2) les dépendances applicatives copiées dedans. Trivy compare la liste complète des paquets installés avec les bases de vulnérabilités connues (NVD, GitHub Advisory) et signale les CVE. Ici le scan prouve que le risque ne vient pas de l'OS mais des libs npm.
+
+> *(Capture à insérer : sortie console Trivy)*
 
 ### 4.3 Exercices de pentest
 
 #### Exercice 4.3.1 — JWT secret faible
 
-**Observation :** le `.env.example` contient `JWT_SECRET="change-me-in-production-use-a-strong-secret-key-please"` — c'est une clé de sécurité **triviale, publique, et prévisible**.
+**Observation :** le `.env.example` fourni contient `JWT_SECRET="change-me-in-production-use-a-strong-secret-key-please"` — un secret **trivial et public**. Le `.env` de ce projet utilise `sdfghjklm…@@…nbvcxz`, un secret « tapé au clavier » : pas de hasard cryptographique, motif de touches reconnaissable, faible entropie. Les deux sont vulnérables — la sécurité d'un JWT signé en HS256 repose **entièrement** sur le secret de signature.
 
-**Étapes pour forger un token admin :**
-1. Se connecter en tant que `user@helpdesk.io / Password123!`
-2. Récupérer le token depuis localStorage ou l'onglet Network de DevTools
-3. Aller sur [jwt.io](https://jwt.io), coller le token
-4. Dans le payload, modifier `"role": "USER"` → `"role": "ADMIN"`
-5. Dans "Verify Signature", saisir le secret `change-me-in-production-use-a-strong-secret-key-please`
-6. Copier le nouveau token signé
-7. Tester : `curl -X DELETE -H "Authorization: Bearer <token_forgé>" http://localhost:3000/api/tickets/<id>`
+**Étapes réalisées pour forger un token admin :**
+1. Connexion en tant que `user@helpdesk.io / Password123!` → récupération du token (`role: USER`)
+2. Décodage du payload (base64), modification `"role": "USER"` → `"role": "ADMIN"`
+3. Re-signature du payload avec le secret connu (HS256)
+4. Appel `DELETE /api/tickets/<id>` avec le token forgé
 
-**Résultat attendu :** Si le secret dans `.env` est le même que dans le `.env.example`, la requête DELETE **réussit**. L'application accepte un token forgé avec des privilèges élevés.
+**Résultats observés (app sur le port 3004) :**
 
-**Pourquoi ça marche ?** La sécurité du JWT repose **entièrement** sur le secret de signature. Si le secret est connu, n'importe qui peut signer un payload arbitraire.
+| Test | Token utilisé | Réponse HTTP |
+|------|---------------|--------------|
+| `DELETE /api/tickets/<id>` | token USER **légitime** | `403 Forbidden` |
+| `DELETE /api/tickets/<id>` | token ADMIN **forgé** | **`200 {"ok":true}`** — ticket réellement supprimé |
+
+**La faille est confirmée :** l'application a accepté un token forgé et exécuté une action réservée aux administrateurs. La route `DELETE` (`src/app/api/tickets/[id]/route.ts`) ne vérifie que `auth.role !== 'ADMIN'` — et `auth.role` provient du JWT. Si le secret est connu, l'attaquant contrôle entièrement le contenu du token.
+
+**Pourquoi ça marche ?** La signature HS256 ne prouve qu'une chose : « celui qui a signé connaissait le secret ». Si le secret est faible/connu, n'importe qui peut signer un payload arbitraire et l'app n'a aucun moyen de le distinguer d'un vrai token.
 
 **3 mitigations :**
 
@@ -265,42 +291,76 @@ trivy image helpdesk:dev --severity HIGH,CRITICAL
 #### Exercice 4.3.2 — Authorization bypass
 
 ```bash
-TOKEN="<votre token user@helpdesk.io>"
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/tickets/<id-ticket-autre-user>
+TOKEN="<token user@helpdesk.io>"
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3004/api/tickets/<id-ticket-autre-user>
 ```
 
-> *(Captures + résultat : l'API retourne-t-elle le ticket d'un autre utilisateur ?)*
+**Test réalisé :** un ticket a été créé au nom de `agent@helpdesk.io`, puis on a tenté de le lire avec le token de `user@helpdesk.io`.
 
-**Ce qu'on teste :** la différence entre **authentification** (qui es-tu ?) et **autorisation** (as-tu le droit de faire ça ?). Un utilisateur authentifié ne doit pas pouvoir lire les ressources d'un autre utilisateur — c'est une vérification d'autorisation qui doit être faite côté serveur pour chaque requête.
+**Résultat :** `403 Forbidden` → `{"error":"Forbidden"}`.
+
+**Sur ce point, l'application est sécurisée.** La route `GET /api/tickets/[id]` contient bien le contrôle `if (auth.role === 'USER' && ticket.authorId !== auth.userId) return 403`. Un USER ne peut pas lire le ticket d'un autre.
+
+**Ce qu'on teste :** la différence entre **authentification** (qui es-tu ?) et **autorisation** (as-tu le droit de faire ça ?). Un utilisateur authentifié ne doit pas pouvoir lire les ressources d'un autre — cette vérification doit être faite côté serveur pour chaque requête. Ici elle est présente. À noter : ce contrôle reste néanmoins contournable via la faille 4.3.1, puisqu'un token forgé en `ADMIN` n'est pas soumis au filtre `role === 'USER'`.
 
 #### Exercice 4.3.3 — Headers de sécurité manquants
 
-> *(Captures à insérer : DevTools → Network → headers de réponse)*
+**Test réalisé :** `curl -I http://localhost:3004/` — inspection des headers de réponse de la page d'accueil.
+
+**Résultat — tous les headers de sécurité sont absents :**
+
+| Header | Présent ? |
+|--------|-----------|
+| `Content-Security-Policy` | ✗ absent |
+| `X-Frame-Options` | ✗ absent |
+| `Strict-Transport-Security` | ✗ absent |
+| `X-Content-Type-Options` | ✗ absent |
+| `Referrer-Policy` | ✗ absent |
+| `Permissions-Policy` | ✗ absent |
+| `X-Powered-By` | ✓ absent — bon point, désactivé par `poweredByHeader: false` dans `next.config.js` |
 
 **Headers manquants et leur rôle :**
 
-| Header | Rôle | Valeur recommandée |
+| Header | Rôle | Valeur appliquée |
 |--------|------|--------------------|
-| `Content-Security-Policy` | Empêche XSS en whitelistant les sources de scripts/styles | `default-src 'self'; script-src 'self'` |
+| `Content-Security-Policy` | Empêche XSS en whitelistant les sources de scripts/styles | `default-src 'self'; script-src 'self' 'unsafe-inline'; …` |
 | `X-Frame-Options` | Empêche le clickjacking (l'app dans une `<iframe>` malveillante) | `DENY` |
-| `Strict-Transport-Security` | Force HTTPS, empêche les attaques man-in-the-middle | `max-age=63072000; includeSubDomains` |
+| `Strict-Transport-Security` | Force HTTPS, empêche les attaques man-in-the-middle | `max-age=63072000; includeSubDomains; preload` |
 | `X-Content-Type-Options` | Empêche le MIME sniffing (navigateur qui devine le type de fichier) | `nosniff` |
 | `Referrer-Policy` | Contrôle les infos envoyées dans le header `Referer` | `strict-origin-when-cross-origin` |
+| `Permissions-Policy` | Désactive l'accès aux API sensibles du navigateur | `camera=(), microphone=(), geolocation=()` |
 
-**Middleware Next.js pour ajouter ces headers :**
+**Correction appliquée :** la faille a été corrigée — un middleware Next.js a été créé dans `src/middleware.ts` et l'image Docker rebuildée. Vérification après correction :
+
+```
+$ curl -I http://localhost:3004/
+HTTP/1.1 200 OK
+content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:
+permissions-policy: camera=(), microphone=(), geolocation=()
+referrer-policy: strict-origin-when-cross-origin
+strict-transport-security: max-age=63072000; includeSubDomains; preload
+x-content-type-options: nosniff
+x-frame-options: DENY
+```
+
+Les 6 headers sont désormais présents sur toutes les pages HTML.
+
+**Code du middleware (`src/middleware.ts`) :**
 
 ```typescript
-// src/middleware.ts
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-export function middleware(request: NextRequest) {
+export function middleware(_request: NextRequest) {
   const response = NextResponse.next();
 
   response.headers.set('X-Frame-Options', 'DENY');
   response.headers.set('X-Content-Type-Options', 'nosniff');
   response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
-  response.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  response.headers.set(
+    'Permissions-Policy',
+    'camera=(), microphone=(), geolocation=()'
+  );
   response.headers.set(
     'Strict-Transport-Security',
     'max-age=63072000; includeSubDomains; preload'
@@ -317,6 +377,14 @@ export const config = {
   matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
 };
 ```
+
+> *(Capture à insérer : sortie `curl -I` avant/après correction)*
+
+### 4.4 Correctif annexe — healthcheck IPv6
+
+Pendant la phase de tests, le conteneur Docker apparaissait en statut `unhealthy`. Cause : la sonde `HEALTHCHECK` interrogeait `http://localhost:3000/...`, or `localhost` résout d'abord en IPv6 (`::1`) dans le conteneur, tandis que le serveur Next.js standalone n'écoute qu'en IPv4 (`0.0.0.0`). La sonde tapait une adresse morte → `Connection refused`.
+
+**Correctif :** remplacer `localhost` par `127.0.0.1` dans le `Dockerfile` et le `docker-compose.yml`. Après rebuild, le conteneur passe `healthy`. C'est un point important : sur Azure App Service, un conteneur `unhealthy` est redémarré ou retiré du routage.
 
 ---
 
