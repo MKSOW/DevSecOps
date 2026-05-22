@@ -96,35 +96,41 @@ docker compose logs -f app
 ### 2.1 Tests existants
 
 ```bash
-npm test        # 35 tests, 4 fichiers
+npm test        # 57 tests, 5 fichiers
 npm run test:coverage
 ```
 
-> *(Capture à insérer : sortie console npm run test:coverage)*
+> *(Capture à insérer : sortie console npx vitest run --coverage)*
 
 ### 2.2 Tests ajoutés
 
-**Fichiers créés :**
-- `tests/unit/permissions.test.ts` — 12 tests sur `src/lib/permissions.ts` (logique RBAC)
-- `tests/unit/extra.test.ts` — 10 tests supplémentaires (token expiré, loginSchema, ticketUpdateSchema)
-- `src/lib/permissions.ts` — nouveau module de logique métier testé
+Deux fichiers étaient fournis (`auth.test.ts`, `validators.test.ts`). J'ai créé 3 nouveaux fichiers :
 
-**Total : 35 tests passent (dont 22 ajoutés)**
+**Fichiers créés :**
+- `src/lib/permissions.ts` — nouveau module de logique RBAC (canEditTicket, canDeleteTicket, canAssignTicket)
+- `tests/unit/permissions.test.ts` — 12 tests sur la logique RBAC
+- `tests/unit/extra.test.ts` — 10 tests (token expiré, loginSchema, ticketUpdateSchema)
+- `tests/unit/mamadou.test.ts` — 22 tests de valeurs limites (boundary testing) sur auth, validators et permissions
+
+**Total : 57 tests passent (dont 44 ajoutés, minimum requis : 5)**
 
 ### Couverture finale
 
-| Fichier | Statements | Branches | Functions |
-|---------|-----------|----------|-----------|
-| `auth.ts` | 80% | 100% | 80% |
-| `permissions.ts` | **100%** | **100%** | **100%** |
-| `validators.ts` | **100%** | **100%** | **100%** |
-| `src/lib` global | ~82% | 93% | 78% |
+| Fichier | Statements | Branches | Functions | Lignes non couvertes |
+|---------|-----------|----------|-----------|----------------------|
+| `auth.ts` | 80% | **100%** | 80% | 39–43 |
+| `permissions.ts` | **100%** | **100%** | **100%** | — |
+| `validators.ts` | **100%** | **100%** | **100%** | — |
+| `prisma.ts` | 0% | 0% | 0% | 1–11 |
+| `src/lib` global | **81.69%** | **93.33%** | **77.77%** | |
 
 **Pourquoi < 100% sur certains fichiers ?**
 
-- `auth.ts` lignes 39-43 : la fonction `getAuthFromRequest(req: NextRequest)` n'est pas couverte car elle nécessite un objet `NextRequest` de Next.js, qui n'est pas instanciable en contexte Node.js pur (elle nécessite le runtime Next.js avec le polyfill Web API). Tester cette fonction demanderait un test d'intégration HTTP, pas un test unitaire.
+- `auth.ts` lignes 39-43 : la fonction `getAuthFromRequest(req: NextRequest)` prend un objet `NextRequest` propre au runtime Next.js, qui n'existe pas en Node.js pur. Impossible à instancier dans Vitest sans lancer un vrai serveur. Ce serait un test d'intégration, pas unitaire.
 
-- `prisma.ts`, routes API (`src/app/api/**`), pages React (`src/app/**`) : ces fichiers ont 0% de couverture car ils interagissent avec une vraie base de données (Prisma), le runtime Next.js, ou le DOM React. Les tester correctement demande des tests d'intégration/E2E (avec un serveur Next.js lancé et une base de test), pas des tests unitaires simples. C'est une limite connue et acceptée : les tests unitaires ne couvrent que la logique pure (`src/lib`).
+- `prisma.ts` : instancie une connexion réelle à SQLite. Le tester en unitaire nécessiterait de mocker entièrement Prisma — hors scope.
+
+- Pages React et routes API (`src/app/**`) : 0% car ils dépendent du DOM, du runtime Next.js, et d'une base de données. Ce sont des candidats pour des tests E2E (Playwright, Cypress), pas unitaires.
 
 ---
 
