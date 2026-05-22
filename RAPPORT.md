@@ -511,13 +511,20 @@ Les 6 headers de sécurité (middleware) sont également présents sur la répon
 
 ### 6.7 Connexion de la CI au déploiement (bonus)
 
-Le TP prévoyait d'authentifier GitHub Actions via un *service principal* (`az ad sp create-for-rbac`). **Impossible ici** : le compte Azure for Students renvoie `Insufficient privileges to complete the operation` — le tenant Entra ID de l'école interdit aux étudiants de créer des applications/identités d'annuaire.
+Cette étape a demandé deux adaptations successives, faute de pouvoir suivre la méthode du TP.
 
-**Alternative retenue — le publish profile.** C'est un identifiant propre à la Web App, téléchargeable sans aucun droit d'annuaire (`az webapp deployment list-publishing-profiles`). Le job `deploy` du workflow a été adapté en conséquence :
+**Problème 1 — pas de service principal.** Le TP prévoyait d'authentifier GitHub Actions via `az ad sp create-for-rbac`. **Impossible ici** : le compte Azure for Students renvoie `Insufficient privileges to complete the operation` — le tenant Entra ID de l'école interdit aux étudiants de créer des identités d'annuaire.
 
-- suppression de l'étape `azure/login` (qui exigeait le service principal) ;
-- ajout du paramètre `publish-profile` à l'action `azure/webapps-deploy` ;
-- l'authentification ACR (`azure/docker-login`) est conservée — elle utilise les identifiants admin du registre, qui ne demandent pas de droits d'annuaire.
+**Problème 2 — le publish profile ne suffit pas pour un conteneur.** Première tentative de contournement : authentifier `azure/webapps-deploy` avec un *publish profile*. Le job a échoué à cette étape. Raison : un publish profile donne accès au endpoint SCM/Kudu (déploiement de **code**), mais changer l'**image d'un conteneur** est une opération ARM (Azure Resource Manager) — que le publish profile ne couvre pas.
+
+**Solution retenue — déploiement continu par webhook ACR.** L'architecture finale ne demande à la CI aucun droit ARM ni d'annuaire :
+
+1. La Web App est configurée pour surveiller le tag `helpdesk:latest` et le déploiement continu est activé (`az webapp deployment container config --enable-cd true`), ce qui fournit une URL de webhook.
+2. Un webhook est créé sur l'ACR (`az acr webhook create`, scope `helpdesk:latest`) : à chaque push de ce tag, l'ACR appelle l'URL de la Web App.
+3. Le job `deploy` se limite donc à : `docker login` ACR → `docker build` → `docker push` des tags `:latest` et `:<sha>`. Le push de `:latest` déclenche le webhook → la Web App re-pull l'image automatiquement.
+4. Un *smoke test* final vérifie que `/api/health` répond `ok`.
+
+*Détail rencontré :* le webhook renvoyait d'abord `401 Unauthorized`. L'authentification basique du endpoint SCM était désactivée sur la Web App ; elle a été réactivée (`basicPublishingCredentialsPolicies` → `allow=true`), après quoi le webhook renvoie `202 Accepted`.
 
 **Secrets GitHub configurés** (Settings → Secrets and variables → Actions) :
 
@@ -527,9 +534,8 @@ Le TP prévoyait d'authentifier GitHub Actions via un *service principal* (`az a
 | `ACR_USERNAME` | `helpdeskacrmks` |
 | `ACR_PASSWORD` | mot de passe admin de l'ACR |
 | `AZURE_WEBAPP_NAME` | `helpdesk-mks` |
-| `AZURE_WEBAPP_PUBLISH_PROFILE` | profil de publication XML de la Web App |
 
-Une fois les secrets en place, un `push` sur `master` déclenche les 4 jobs, dont `deploy` qui rebuild l'image, la pousse sur l'ACR (taggée avec le SHA du commit) et met à jour la Web App.
+Un `push` sur `master` déclenche les 4 jobs : `test`, `security`, `docker`, puis `deploy` qui rebuild l'image, la pousse sur l'ACR et provoque — via le webhook — le redéploiement de la Web App.
 
 > *(Capture à insérer : onglet GitHub Actions avec les 4 jobs — dont deploy — en vert)*
 
@@ -600,3 +606,6 @@ Deux ressources facturées : **ACR Basic** (~5 $/mois) + **App Service Plan B1**
 | Azure : image au mauvais chemin | Double préfixe du registre par `az webapp create` | Chemin d'image complet via `az webapp config container set` |
 | Azure : base de données non initialisable | L'image standalone n'a ni le CLI Prisma ni `tsx` | Base SQLite seedée pendant le build, embarquée dans l'image |
 | Azure CLI non installable | Ubuntu 25.10 trop récent, pas de paquet Microsoft | Installation via `pip` dans un venv Python |
+| CI : pas de service principal | Tenant Entra ID interdit la création d'identités aux étudiants | Déploiement continu par webhook ACR (aucun droit d'annuaire requis) |
+| CI : `azure/webapps-deploy` en échec | Le publish profile ne couvre pas l'opération ARM de changement d'image | Webhook ACR → la Web App re-pull `:latest` toute seule |
+| Webhook ACR : `401 Unauthorized` | Authentification basique SCM désactivée sur la Web App | Réactivation de `basicPublishingCredentialsPolicies` |
