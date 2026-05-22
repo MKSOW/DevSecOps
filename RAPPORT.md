@@ -509,6 +509,30 @@ Les 6 headers de sécurité (middleware) sont également présents sur la répon
 
 > *(Captures à insérer : `curl .../api/health` + navigateur sur https://helpdesk-mks.azurewebsites.net avec le dashboard connecté)*
 
+### 6.7 Connexion de la CI au déploiement (bonus)
+
+Le TP prévoyait d'authentifier GitHub Actions via un *service principal* (`az ad sp create-for-rbac`). **Impossible ici** : le compte Azure for Students renvoie `Insufficient privileges to complete the operation` — le tenant Entra ID de l'école interdit aux étudiants de créer des applications/identités d'annuaire.
+
+**Alternative retenue — le publish profile.** C'est un identifiant propre à la Web App, téléchargeable sans aucun droit d'annuaire (`az webapp deployment list-publishing-profiles`). Le job `deploy` du workflow a été adapté en conséquence :
+
+- suppression de l'étape `azure/login` (qui exigeait le service principal) ;
+- ajout du paramètre `publish-profile` à l'action `azure/webapps-deploy` ;
+- l'authentification ACR (`azure/docker-login`) est conservée — elle utilise les identifiants admin du registre, qui ne demandent pas de droits d'annuaire.
+
+**Secrets GitHub configurés** (Settings → Secrets and variables → Actions) :
+
+| Secret | Contenu |
+|--------|---------|
+| `ACR_LOGIN_SERVER` | `helpdeskacrmks.azurecr.io` |
+| `ACR_USERNAME` | `helpdeskacrmks` |
+| `ACR_PASSWORD` | mot de passe admin de l'ACR |
+| `AZURE_WEBAPP_NAME` | `helpdesk-mks` |
+| `AZURE_WEBAPP_PUBLISH_PROFILE` | profil de publication XML de la Web App |
+
+Une fois les secrets en place, un `push` sur `master` déclenche les 4 jobs, dont `deploy` qui rebuild l'image, la pousse sur l'ACR (taggée avec le SHA du commit) et met à jour la Web App.
+
+> *(Capture à insérer : onglet GitHub Actions avec les 4 jobs — dont deploy — en vert)*
+
 ---
 
 ## Synthèse finale
