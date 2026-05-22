@@ -429,6 +429,8 @@ Deux ajustements ont été indispensables pour que le pipeline puisse s'exécute
 
 2. **Configuration ESLint manquante.** Le projet n'avait aucun fichier `.eslintrc`. La commande `npm run lint` (`next lint`) devenait alors **interactive** (elle demandait de choisir une config) — ce qui bloque en CI puisqu'aucune entrée clavier n'est possible. Un fichier `.eslintrc.json` (`extends: next/core-web-vitals`) a été ajouté. Résultat : `npm run lint` se termine avec le code 0 (3 warnings, 0 erreur).
 
+3. **Image Docker introuvable par Trivy (job `docker`).** Au premier run, le job `docker` a échoué : `No such image: helpdesk:<sha>`. Cause : `docker/build-push-action` utilise Buildx, qui build l'image dans son propre cache et **non** dans le magasin d'images du démon Docker. Avec `push: false` et sans `load: true`, l'image n'est visible nulle part — Trivy ne peut pas la scanner. Correctif : ajout de `load: true` à l'étape de build, qui charge l'image dans le démon Docker local.
+
 Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run test:coverage` → 57 tests OK ✓ · `npm run build` → build réussi ✓.
 
 ### 5.3 Résultats
