@@ -129,10 +129,10 @@ describe('validators.ts — ticketCreateSchema (valeurs limites)', () => {
     expect(result.success).toBe(false);
   });
 
-  it('rejette une description de moins de 10 caractères', () => {
+  it('rejette une description de 9 caractères (sous le minimum de 10)', () => {
     const result = ticketCreateSchema.safeParse({
       title: 'Mon ticket',
-      description: 'Trop court',
+      description: '123456789',
     });
     expect(result.success).toBe(false);
   });
