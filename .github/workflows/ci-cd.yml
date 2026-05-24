@@ -108,8 +108,11 @@ jobs:
   # =========================
   # 4. Deploy Azure (master uniquement)
   # =========================
-  # Authentification via publish profile (le compte Azure for Students
-  # n'autorise pas la création d'un service principal).
+  # Le compte Azure for Students n'autorise pas la création d'un service
+  # principal. Le déploiement repose donc sur le déploiement continu Azure :
+  # ce job pousse l'image taggée :latest sur l'ACR, et un webhook ACR notifie
+  # la Web App qui re-pull l'image automatiquement. La CI n'a besoin que des
+  # identifiants de push ACR — aucun droit d'annuaire Entra ID requis.
   deploy:
     name: Deploy to Azure
     runs-on: ubuntu-latest
@@ -126,6 +129,7 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
+      # Le push du tag :latest déclenche le webhook ACR -> redéploiement Web App.
       - name: Build & push to ACR
         run: |
           docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/helpdesk:${{ github.sha }} .
@@ -133,9 +137,17 @@ jobs:
           docker push ${{ secrets.ACR_LOGIN_SERVER }}/helpdesk:${{ github.sha }}
           docker push ${{ secrets.ACR_LOGIN_SERVER }}/helpdesk:latest
 
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          images: ${{ secrets.ACR_LOGIN_SERVER }}/helpdesk:${{ github.sha }}
+      - name: Smoke test post-déploiement
+        run: |
+          echo "Push terminé — le webhook ACR redéploie la Web App."
+          sleep 90
+          for i in $(seq 1 16); do
+            if curl -sf -m 15 "https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health" | grep -q '"ok"'; then
+              echo "Web App joignable et saine."
+              exit 0
+            fi
+            echo "Attente du redéploiement... tentative $i"
+            sleep 15
+          done
+          echo "La Web App n'a pas répondu OK dans le délai imparti."
+          exit 1

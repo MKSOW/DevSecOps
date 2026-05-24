@@ -1,83 +1,113 @@
-# RAPPORT — TP DevSecOps : De l'application au déploiement Azure
+# Rapport de TP — DevSecOps : de l'application au déploiement Azure
 
-**Auteur :** Mamadou  
-**Date :** 2026-05-22  
-**Application :** Helpdesk (Next.js fullstack — gestion de tickets de support)
+**Mamadou Khaly Sow**
+Master 1 — Expert en études et développement du système d'information
+Mai 2026
+
+Application support : **Helpdesk**, une plateforme de gestion de tickets écrite
+en Next.js (fullstack TypeScript).
+Application déployée et accessible : **https://helpdesk-mks.azurewebsites.net**
 
 ---
 
 ## Mise en route
 
-**Checkpoint : capture d'écran de la page /dashboard**  
-> *(À insérer : capture d'écran de http://localhost:3000/dashboard avec au moins un ticket visible, connecté en admin@helpdesk.io / Password123!)*
+J'ai d'abord récupéré le projet, installé les dépendances et lancé l'application
+en local pour la prendre en main avant de commencer le TP.
+
+```bash
+npm install
+cp .env.example .env
+npx prisma migrate dev --name init
+npx prisma db seed
+npm run dev
+```
+
+Je me suis connecté avec le compte `admin@helpdesk.io` et j'ai vérifié que le
+dashboard affichait bien des tickets.
+
+*Capture à fournir : page `/dashboard` avec au moins un ticket, connecté en admin.*
 
 ---
 
-## ÉTAPE 1 — Conteneurisation Docker
+## Étape 1 — Conteneurisation Docker
 
-### 1.1 Questions sur le Dockerfile
+### 1.1 Lecture du Dockerfile et questions
 
-**Q1 — Pourquoi un multi-stage build plutôt qu'un seul FROM ?**
+**Pourquoi un multi-stage build plutôt qu'un seul `FROM` ?**
 
-Un build avec un seul `FROM` embarquerait dans l'image finale l'intégralité de l'outillage de compilation : TypeScript, les devDependencies (Vitest, ESLint, etc.), les fichiers sources `.ts`, et tous les modules de développement. L'image résultante dépasserait 1,5 Go.
+Si on construisait l'image avec un seul `FROM`, on se retrouverait avec tout
+l'outillage de compilation dans l'image finale : le compilateur TypeScript, les
+devDependencies (Vitest, ESLint…), les fichiers sources `.ts`, etc. L'image
+pèserait facilement plus de 1,5 Go alors que rien de tout ça n'est utile pour
+faire *tourner* l'application.
 
-Le multi-stage sépare le processus en 3 étapes isolées :
+Le Dockerfile découpe donc le travail en trois étapes :
 
-| Stage | Rôle | Ce qu'il contient |
-|-------|------|-------------------|
-| `deps` | Installation des dépendances | `node_modules` complet |
-| `builder` | Compilation | TypeScript → JavaScript, génération Prisma client |
-| `runner` | Image finale | **Uniquement** le code compilé `.next/standalone` + modules runtime |
+- `deps` installe les dépendances npm,
+- `builder` compile l'application et génère le client Prisma,
+- `runner` est l'image finale, qui ne récupère que le résultat compilé
+  (`.next/standalone`) et les quelques modules nécessaires à l'exécution.
 
-L'image finale ne contient que le strict nécessaire pour faire tourner l'application. Elle fait ~150 Mo. Docker exécute chaque stage dans un layer isolé et ne copie que ce qu'on lui demande explicitement (`COPY --from=builder ...`). Les stages intermédiaires sont jetés.
+Chaque étape est un layer isolé, et Docker ne copie d'une étape à l'autre que ce
+qu'on lui demande explicitement avec `COPY --from=...`. Les étapes intermédiaires
+sont jetées. Au final mon image fait 235 Mo.
 
-**Q2 — Que fait `output: 'standalone'` dans next.config.js et comment Docker l'exploite ?**
+**Que fait `output: 'standalone'` dans `next.config.js` ?**
 
-En mode standard, Next.js démarre via `next start` qui requiert la présence de tous les `node_modules` (800+ Mo). Avec `output: 'standalone'`, Next.js effectue une analyse statique des imports et génère un dossier `.next/standalone/` contenant :
-- Un fichier `server.js` autonome (le serveur HTTP)
-- Uniquement les modules Node.js réellement importés (tree-shaking côté serveur)
+Normalement Next.js se lance avec `next start`, qui a besoin de tout le dossier
+`node_modules` (plusieurs centaines de Mo). Avec `output: 'standalone'`, Next.js
+analyse les imports réellement utilisés et génère un dossier `.next/standalone`
+qui contient un `server.js` autonome et uniquement les modules nécessaires.
 
-Docker exploite cela dans le stage `runner` en ne copiant que `.next/standalone` au lieu de tout `node_modules`. Résultat : des dizaines de Mo au lieu de centaines.
+Le Dockerfile s'appuie là-dessus dans l'étape `runner` : au lieu de recopier tout
+`node_modules`, il ne copie que `.next/standalone`. C'est ce qui permet de garder
+l'image légère.
 
-```dockerfile
-# Sans standalone → copierait node_modules entier
-COPY --from=builder /app/node_modules ./node_modules   # 600+ Mo
+**Pourquoi un utilisateur non-root `nextjs` ?**
 
-# Avec standalone → copie uniquement le bundle autonome
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./  # ~30 Mo
-```
+Par défaut un conteneur exécute ses processus en `root`. Si l'application a une
+faille permettant d'exécuter du code, l'attaquant se retrouve root dans le
+conteneur et peut faire beaucoup de dégâts. En créant un utilisateur dédié
+`nextjs` (UID 1001) et en faisant tourner l'app sous cet utilisateur, on applique
+le principe du moindre privilège : même en cas de faille, l'attaquant est limité
+aux fichiers de cet utilisateur, il ne peut pas toucher au système.
 
-**Q3 — Pourquoi créer un utilisateur non-root `nextjs` ?**
+**À quoi sert le `HEALTHCHECK` ?**
 
-Par défaut, Docker exécute les processus en tant que `root` (UID 0), le superutilisateur du système. Si l'application présente une vulnérabilité (Remote Code Execution, injection de commande), un attaquant qui obtient un shell dans le conteneur disposerait des droits root. Avec un utilisateur dédié `nextjs` (UID 1001) :
-
-- Il ne peut pas lire `/etc/shadow`, modifier les binaires système, ou installer des paquets
-- La surface d'attaque est réduite : l'attaquant est confiné aux fichiers appartenant à cet utilisateur
-- C'est le principe du **moindre privilège** (Principle of Least Privilege), pilier de la sécurité
-
-**Q4 — À quoi sert `HEALTHCHECK` dans le Dockerfile ?**
-
-```dockerfile
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
-```
-
-Le HEALTHCHECK est une sonde de santé automatique. Toutes les 30 secondes, Docker exécute la commande `wget --spider /api/health`. Si l'application répond `200 OK`, le conteneur est `healthy`. Si la réponse échoue 3 fois consécutives (après 10s de grâce au démarrage), il passe `unhealthy`.
-
-**Usages pratiques :**
-- Docker Compose peut conditionner le démarrage d'un service B à la santé de A (`depends_on: condition: service_healthy`)
-- Les orchestrateurs (Kubernetes, Azure App Service) redémarrent automatiquement les conteneurs `unhealthy`
-- Azure App Service utilise cette sonde pour router le trafic uniquement vers les instances saines
+C'est une sonde que Docker exécute régulièrement (toutes les 30 secondes ici)
+pour savoir si l'application répond. La commande appelle `/api/health` ; si ça
+répond, le conteneur est marqué `healthy`, sinon `unhealthy` après plusieurs
+échecs. C'est utile pour Docker Compose (un service peut attendre qu'un autre
+soit `healthy`) et surtout pour un hébergeur comme Azure App Service, qui
+redémarre un conteneur `unhealthy` ou arrête de lui envoyer du trafic.
 
 ### 1.2 Build et validation
+
+J'ai construit l'image puis vérifié sa taille :
 
 ```bash
 docker build -t helpdesk:dev .
 docker images | grep helpdesk
 ```
 
-> *(Capture à insérer : taille de l'image < 300 Mo)*
-> *(Capture à insérer : `curl http://localhost:3000/api/health` → `{"status":"ok",...}`)*
+L'image fait **235 Mo**, donc en dessous des 300 Mo demandés.
+
+J'ai ensuite lancé le conteneur et testé la sonde de santé. À noter : le port
+3000 était déjà pris par un autre projet sur ma machine, j'ai donc utilisé le
+port 3004 pour le reste du TP.
+
+```bash
+curl http://localhost:3004/api/health
+{"status":"ok","timestamp":"...","uptime":...}
+```
+
+La connexion fonctionne avec les comptes de démo. Je suis tombé sur un petit
+souci au passage : la première fois, le login renvoyait une erreur interne. Le
+conteneur avait démarré avant que la base soit prête, et Prisma avait mis en
+cache une connexion vide. Un simple `docker restart` a réglé le problème.
+
+*Captures à fournir : taille de l'image, réponse de `/api/health`.*
 
 ### 1.3 Docker Compose
 
@@ -87,58 +117,71 @@ docker compose up -d --build
 docker compose logs -f app
 ```
 
-> *(Capture à insérer : logs de démarrage sans erreur)*
+Le `docker compose up` fonctionne. J'ai aussi corrigé un petit avertissement :
+le `docker-compose.yml` commençait par `version: '3.9'`, attribut devenu obsolète
+avec Docker Compose v2, je l'ai retiré.
+
+*Capture à fournir : logs de démarrage sans erreur.*
 
 ---
 
-## ÉTAPE 2 — Tests unitaires
+## Étape 2 — Tests unitaires
 
 ### 2.1 Tests existants
 
 ```bash
-npm test        # 57 tests, 5 fichiers
+npm test
 npm run test:coverage
 ```
 
-> *(Capture à insérer : sortie console npx vitest run --coverage)*
+Le projet fournissait deux fichiers de tests : `auth.test.ts` et
+`validators.test.ts`. Tous les tests passent.
 
-### 2.2 Tests ajoutés
+### 2.2 Tests que j'ai ajoutés
 
-Deux fichiers étaient fournis (`auth.test.ts`, `validators.test.ts`). J'ai créé 3 nouveaux fichiers :
+Le TP demandait au moins 5 tests supplémentaires. J'ai créé un module de logique
+métier puis trois fichiers de tests :
 
-**Fichiers créés :**
-- `src/lib/permissions.ts` — nouveau module de logique RBAC (canEditTicket, canDeleteTicket, canAssignTicket)
-- `tests/unit/permissions.test.ts` — 12 tests sur la logique RBAC
-- `tests/unit/extra.test.ts` — 10 tests (token expiré, loginSchema, ticketUpdateSchema)
-- `tests/unit/mamadou.test.ts` — 22 tests de valeurs limites (boundary testing) sur auth, validators et permissions
+- `src/lib/permissions.ts` : un module RBAC que j'ai écrit, avec
+  `canEditTicket`, `canDeleteTicket` et `canAssignTicket`.
+- `tests/unit/permissions.test.ts` : 12 tests sur ces fonctions.
+- `tests/unit/extra.test.ts` : 10 tests (token JWT expiré, `loginSchema`,
+  `ticketUpdateSchema`).
+- `tests/unit/mamadou.test.ts` : 22 tests de valeurs limites, c'est-à-dire que
+  je teste les frontières exactes des règles de validation (un mot de passe de
+  7 caractères doit échouer, un de 8 doit passer, etc.). C'est là que les bugs
+  se cachent le plus souvent.
 
-**Total : 57 tests passent (dont 44 ajoutés, minimum requis : 5)**
+Au total **57 tests passent**, dont 44 que j'ai ajoutés.
 
-### Couverture finale
+### Couverture de code
 
-| Fichier | Statements | Branches | Functions | Lignes non couvertes |
-|---------|-----------|----------|-----------|----------------------|
-| `auth.ts` | 80% | **100%** | 80% | 39–43 |
-| `permissions.ts` | **100%** | **100%** | **100%** | — |
-| `validators.ts` | **100%** | **100%** | **100%** | — |
-| `prisma.ts` | 0% | 0% | 0% | 1–11 |
-| `src/lib` global | **81.69%** | **93.33%** | **77.77%** | |
+| Fichier | Statements | Branches | Functions |
+|---------|-----------|----------|-----------|
+| `auth.ts` | 80 % | 100 % | 80 % |
+| `permissions.ts` | 100 % | 100 % | 100 % |
+| `validators.ts` | 100 % | 100 % | 100 % |
+| `prisma.ts` | 0 % | 0 % | 0 % |
+| `src/lib` (global) | 81,7 % | 93,3 % | 77,8 % |
 
-**Pourquoi < 100% sur certains fichiers ?**
+La couverture globale affichée par Vitest est faible (environ 5 %) parce que
+l'outil compte aussi les pages React et les routes API, qui ne sont pas testées
+en unitaire. Ce qui compte vraiment c'est la colonne `src/lib`, la logique pure.
 
-- `auth.ts` lignes 39-43 : la fonction `getAuthFromRequest(req: NextRequest)` prend un objet `NextRequest` propre au runtime Next.js, qui n'existe pas en Node.js pur. Impossible à instancier dans Vitest sans lancer un vrai serveur. Ce serait un test d'intégration, pas unitaire.
+Pourquoi pas 100 % partout ? Dans `auth.ts`, la fonction `getAuthFromRequest`
+(lignes 39-43) prend en paramètre un objet `NextRequest`, propre au runtime
+Next.js, que je ne peux pas créer dans un test Vitest classique : il faudrait un
+test d'intégration. Et `prisma.ts` ouvre une vraie connexion à la base, donc le
+tester en unitaire n'a pas de sens, il faudrait mocker tout Prisma.
 
-- `prisma.ts` : instancie une connexion réelle à SQLite. Le tester en unitaire nécessiterait de mocker entièrement Prisma — hors scope.
-
-- Pages React et routes API (`src/app/**`) : 0% car ils dépendent du DOM, du runtime Next.js, et d'une base de données. Ce sont des candidats pour des tests E2E (Playwright, Cypress), pas unitaires.
+*Capture à fournir : sortie de `npm run test:coverage`.*
 
 ---
 
-## ÉTAPE 3 — Tests de montée en charge k6
+## Étape 3 — Tests de montée en charge avec k6
 
-> Remarque : l'application tourne dans le conteneur Docker exposé sur le port **3004**
-> (le port 3000 étant occupé par un autre service local). Les tests k6 sont donc
-> lancés avec `-e BASE_URL=http://localhost:3004`.
+L'application tournait dans le conteneur sur le port 3004, j'ai donc lancé les
+tests k6 avec `-e BASE_URL=http://localhost:3004`.
 
 ### 3.1 Smoke test
 
@@ -146,22 +189,16 @@ Deux fichiers étaient fournis (`auth.test.ts`, `validators.test.ts`). J'ai cré
 k6 run -e BASE_URL=http://localhost:3004 k6/smoke-test.js
 ```
 
-**Ce que mesure ce test :**
-- 1 seul utilisateur virtuel (VU) pendant 10 secondes
-- Appelle `/api/health` en continu
-- Seuils : 95% des requêtes < 200ms, taux d'erreur < 1%
+Ce test envoie des requêtes avec un seul utilisateur virtuel pendant 10 secondes,
+juste pour confirmer que l'app répond avant de lancer le vrai test de charge.
 
-**Résultats :**
+| Métrique | Valeur | Seuil |
+|----------|--------|-------|
+| Latence p(95) | 6,19 ms | < 200 ms |
+| Taux d'erreur | 0,00 % | < 1 % |
+| Requêtes | 2 499 (~250/s) | — |
 
-| Métrique | Valeur | Seuil | Verdict |
-|----------|--------|-------|---------|
-| p(95) latence | 6.19 ms | < 200 ms | ✓ |
-| Taux d'erreur | 0.00% | < 1% | ✓ |
-| Requêtes | 2 499 (~250 req/s) | — | 100% OK |
-
-Le smoke test confirme que l'app répond correctement à faible charge avant de lancer le test lourd.
-
-> *(Capture à insérer : résumé console k6)*
+Tout passe, l'application répond très bien à faible charge.
 
 ### 3.2 Test de charge
 
@@ -169,183 +206,186 @@ Le smoke test confirme que l'app répond correctement à faible charge avant de 
 k6 run -e BASE_URL=http://localhost:3004 k6/load-test.js
 ```
 
-**Scénario de montée :**
-- 0→10 VUs en 30s (warm-up)
-- 10→50 VUs en 1 minute (montée)
-- 50 VUs pendant 2 minutes (palier de charge soutenue)
-- 50→0 VUs en 30s (descente)
+Le scénario monte progressivement : 0 à 10 utilisateurs virtuels en 30 s, puis
+jusqu'à 50 en une minute, un palier de 2 minutes à 50, et une descente de 30 s.
 
-**Métriques clés :**
-- **p(95)** : 95ème percentile de latence — 95% des requêtes sont traitées en moins de X ms. Plus révélateur que la moyenne, car il montre le cas le plus fréquent "pas de chance".
-- **RPS** (Requests Per Second) : débit — combien de requêtes par seconde le serveur traite
-- **Taux d'erreur** : % de requêtes ayant échoué (HTTP 4xx/5xx ou timeout)
+Quelques définitions utiles pour lire les résultats :
 
-**Résultats :**
+- **p(95)** : 95 % des requêtes sont traitées en moins de cette valeur. C'est
+  plus parlant que la moyenne, qui peut masquer les requêtes lentes.
+- **RPS** : nombre de requêtes traitées par seconde.
+- **Taux d'erreur** : pourcentage de requêtes en échec (4xx, 5xx, timeout).
 
-| Métrique | Valeur | Seuil | Verdict |
-|----------|--------|-------|---------|
-| Requêtes totales | 6 253 | — | — |
-| Débit (RPS) | 25.9 req/s | — | — |
-| Taux d'erreur | 0.00% | < 1% | ✓ |
-| Checks réussis | 8 336 / 8 336 | — | ✓ |
-| Latence médiane | 811 ms | — | — |
-| Latence moyenne | 1 071 ms | — | — |
-| **p(95) latence** | **3 176 ms** | < 500 ms | **✗** |
-| Latence max | 7 485 ms | — | — |
-| p(95) route `/api/tickets` (GET) | 3 999 ms | — | route la plus lente |
+Résultats obtenus :
 
-**Interprétation :** le seuil `p(95) < 500 ms` est dépassé, donc k6 termine avec le code de sortie 99 et affiche `thresholds on metrics 'http_req_duration' have been crossed`. **C'est le résultat attendu et utile** : le but d'un test de charge est de révéler la limite de l'application. Le test lui-même s'est déroulé sans incident — ce message n'est pas une panne.
+| Métrique | Valeur | Seuil |
+|----------|--------|-------|
+| Requêtes totales | 6 253 | — |
+| Débit | 25,9 req/s | — |
+| Taux d'erreur | 0,00 % | < 1 % |
+| Checks réussis | 8 336 / 8 336 | — |
+| Latence médiane | 811 ms | — |
+| Latence moyenne | 1 071 ms | — |
+| Latence p(95) | 3 176 ms | < 500 ms |
+| Latence max | 7 485 ms | — |
+| p(95) sur `GET /api/tickets` | 3 999 ms | — |
 
-L'app reste **fonctionnellement correcte** sous charge (0% d'erreur, aucun crash, aucun 5xx, 8 336 checks réussis), mais elle devient **lente** : la latence p(95) passe de **6 ms** (smoke, 1 VU) à **3 176 ms** (charge, 50 VUs), soit une dégradation d'un facteur ~500.
+k6 se termine avec le code 99 et affiche `thresholds on metrics
+'http_req_duration' have been crossed`. Au début j'ai cru à une panne, mais en
+fait c'est normal : le seuil p(95) < 500 ms n'est pas tenu, k6 le signale. C'est
+justement le but d'un test de charge, révéler la limite de l'application. Le test
+lui-même s'est déroulé sans incident.
 
-**Deux goulots d'étranglement identifiés :**
+Ce qui est intéressant, c'est que l'application reste **correcte**
+fonctionnellement (0 % d'erreur, aucun crash, les 8 336 checks passent), mais
+elle devient **lente** : la latence p(95) passe de 6 ms avec 1 utilisateur à
+3 176 ms avec 50, soit un facteur d'environ 500.
 
-1. **SQLite est mono-écriture.** Chaque création de ticket prend un verrou exclusif sur le fichier de base. Avec 50 VUs créant des tickets en parallèle, les écritures se sérialisent et forment une file d'attente.
+J'ai identifié deux causes :
 
-2. **`GET /api/tickets` n'a aucune pagination** (`src/app/api/tickets/route.ts` — `findMany()` sans `take`/`skip`). Le test a créé ~2 084 tickets. À chaque appel, la requête renvoie *tous* les tickets, chacun enrichi de 3 jointures (auteur, assigné, nombre de commentaires). Plus le test avance, plus le jeu de résultats grossit — d'où le p(95) de ~4 s sur cette route.
+1. **SQLite n'autorise qu'une écriture à la fois.** Chaque création de ticket
+   pose un verrou exclusif sur le fichier de base. Avec 50 utilisateurs qui en
+   créent en parallèle, les écritures font la queue.
+2. **La route `GET /api/tickets` ne pagine pas.** En regardant le code
+   (`src/app/api/tickets/route.ts`), le `findMany()` n'a ni `take` ni `skip` :
+   il renvoie tous les tickets, chacun avec trois jointures. Or le test crée à
+   peu près 2 000 tickets au fil de l'eau, donc plus le test avance, plus cette
+   requête renvoie de données et plus elle ralentit. C'est elle la plus lente.
 
-**Pistes de correction :** ajouter une pagination (`take: 20, skip: …`) sur la liste des tickets, et migrer SQLite → PostgreSQL pour gérer les écritures concurrentes.
+Pour corriger ça il faudrait paginer la liste des tickets et, à plus long terme,
+remplacer SQLite par PostgreSQL qui gère la concurrence.
 
-> *(Captures à insérer : résumé console + fichier k6-summary.json — généré à la racine du projet)*
+*Captures à fournir : résumé console k6 + le fichier `k6-summary.json`.*
 
-### 3.3 Test de rupture (bonus — 200 VUs)
+### 3.3 Test de rupture (bonus)
 
-> *(Si réalisé : documenter ici à partir de quel nombre de VUs les timeouts/503 apparaissent et pourquoi — SQLite est mono-écriture, ce qui crée un goulot d'étranglement à haute concurrence)*
+Non réalisé. Si je le faisais, je m'attendrais à voir des timeouts et des 503
+apparaître bien avant 200 utilisateurs, le goulot d'étranglement SQLite étant
+déjà visible à 50.
 
 ---
 
-## ÉTAPE 4 — Sécurité
+## Étape 4 — Sécurité
 
 ### 4.1 Audit des dépendances
 
 ```bash
-npm audit
 npm audit --audit-level=high
 ```
 
-**Résultats :** 11 vulnérabilités au total.
+L'audit remonte **11 vulnérabilités** : 0 critique, 4 hautes, 7 modérées.
 
-| Sévérité | Nombre |
-|----------|--------|
-| Critique | 0 |
-| Haute | 4 |
-| Modérée | 7 |
-| Basse | 0 |
+Les failles hautes touchent `next`, `eslint-config-next`,
+`@next/eslint-plugin-next` et `glob`. Les modérées concernent surtout des
+dépendances de développement (`vitest`, `vite`, `esbuild`, `postcss`).
 
-**Paquets touchés en sévérité haute :** `next`, `eslint-config-next`, `@next/eslint-plugin-next`, `glob`. Les vulnérabilités modérées concernent surtout des dépendances de développement (`vitest`, `vite`, `esbuild`, `postcss`).
+La principale concerne Next.js lui-même (version 14.2.33) : plusieurs avis de
+sécurité, notamment des dénis de service sur les Server Components. Le correctif
+complet impose de passer à `next@16`, ce qui est un changement majeur. En vrai
+projet je planifierais cette montée de version plutôt que de lancer
+`npm audit fix --force` à l'aveugle, qui casserait le build.
 
-La principale faille vient de `next` lui-même (version 14.2.33) : plusieurs avis de sécurité (DoS sur Server Components, cache poisoning, SSRF via WebSocket…). Le correctif complet impose `next@16`, un changement majeur (breaking change). En contexte réel on planifierait cette montée de version, sans `npm audit fix --force` à l'aveugle qui casserait le build.
+*Capture à fournir : sortie de `npm audit`.*
 
-> *(Capture à insérer : sortie console npm audit)*
-
-### 4.2 Scan Trivy
+### 4.2 Scan de l'image avec Trivy
 
 ```bash
 trivy image helpdesk:dev --severity HIGH,CRITICAL
 ```
 
-**Résultats :**
-
 | Couche scannée | CRITICAL | HIGH |
 |----------------|----------|------|
 | OS Alpine (paquets système) | 0 | 0 |
-| Paquets Node.js (dépendances app) | 0 | 18 |
+| Paquets Node.js (dépendances) | 0 | 18 |
 
-**Observation clé :** la couche système (Alpine Linux) est **totalement propre** — 0 vulnérabilité HIGH/CRITICAL. Les 18 failles hautes sont **toutes** dans les dépendances npm embarquées dans l'image (`next`, `tar`…). Choisir `node:20-alpine` comme image de base était donc un bon choix sécurité : Alpine est minimaliste et contient très peu de paquets système exploitables. Le risque résiduel est entièrement dans le code applicatif — c'est cohérent avec le résultat de `npm audit`.
+Le résultat que je trouve intéressant : la couche système (Alpine Linux) est
+totalement propre, aucune vulnérabilité. Les 18 failles hautes sont toutes dans
+les dépendances npm embarquées (`next`, `tar`…). Choisir `node:20-alpine` comme
+image de base était donc un bon choix, Alpine est minimaliste et contient très
+peu de paquets exploitables. Le risque vient uniquement du code applicatif, ce
+qui rejoint le résultat de `npm audit`.
 
-**Pourquoi scanner l'image ?** Une image Docker empile deux sources de risque : (1) les paquets système de l'OS de base, (2) les dépendances applicatives copiées dedans. Trivy compare la liste complète des paquets installés avec les bases de vulnérabilités connues (NVD, GitHub Advisory) et signale les CVE. Ici le scan prouve que le risque ne vient pas de l'OS mais des libs npm.
+Le scan d'image est utile parce qu'une image Docker empile deux sources de
+risque : les paquets de l'OS de base et les dépendances de l'application. Trivy
+compare tout ça aux bases de vulnérabilités connues et signale les CVE.
 
-> *(Capture à insérer : sortie console Trivy)*
+*Capture à fournir : sortie de Trivy.*
 
-### 4.3 Exercices de pentest
+### 4.3 Pentest
 
-#### Exercice 4.3.1 — JWT secret faible
+**Exercice 4.3.1 — JWT signé avec un secret faible**
 
-**Observation :** le `.env.example` fourni contient `JWT_SECRET="change-me-in-production-use-a-strong-secret-key-please"` — un secret **trivial et public**. Le `.env` de ce projet utilise `sdfghjklm…@@…nbvcxz`, un secret « tapé au clavier » : pas de hasard cryptographique, motif de touches reconnaissable, faible entropie. Les deux sont vulnérables — la sécurité d'un JWT signé en HS256 repose **entièrement** sur le secret de signature.
+Le `.env.example` fourni contient un `JWT_SECRET` trivial. Le `.env` du projet
+en a un autre, mais à peine mieux : c'est une suite de touches tapées au clavier,
+sans aléa réel. Or la sécurité d'un JWT signé en HS256 repose entièrement sur ce
+secret.
 
-**Étapes réalisées pour forger un token admin :**
-1. Connexion en tant que `user@helpdesk.io / Password123!` → récupération du token (`role: USER`)
-2. Décodage du payload (base64), modification `"role": "USER"` → `"role": "ADMIN"`
-3. Re-signature du payload avec le secret connu (HS256)
-4. Appel `DELETE /api/tickets/<id>` avec le token forgé
+J'ai voulu vérifier qu'on pouvait forger un token administrateur. La démarche :
 
-**Résultats observés (app sur le port 3004) :**
+1. Je me connecte en `user@helpdesk.io` et je récupère mon token (rôle USER).
+2. Je décode le payload, je change `"role": "USER"` en `"role": "ADMIN"`.
+3. Je re-signe le token avec le secret connu.
+4. J'appelle `DELETE /api/tickets/<id>` avec ce token forgé.
 
-| Test | Token utilisé | Réponse HTTP |
-|------|---------------|--------------|
-| `DELETE /api/tickets/<id>` | token USER **légitime** | `403 Forbidden` |
-| `DELETE /api/tickets/<id>` | token ADMIN **forgé** | **`200 {"ok":true}`** — ticket réellement supprimé |
+| Test | Token | Réponse |
+|------|-------|---------|
+| `DELETE /api/tickets/<id>` | token USER légitime | `403 Forbidden` |
+| `DELETE /api/tickets/<id>` | token ADMIN forgé | `200 {"ok":true}` |
 
-**La faille est confirmée :** l'application a accepté un token forgé et exécuté une action réservée aux administrateurs. La route `DELETE` (`src/app/api/tickets/[id]/route.ts`) ne vérifie que `auth.role !== 'ADMIN'` — et `auth.role` provient du JWT. Si le secret est connu, l'attaquant contrôle entièrement le contenu du token.
+La faille est confirmée : avec le token forgé, le ticket est réellement supprimé.
+La route `DELETE` vérifie seulement `auth.role !== 'ADMIN'`, et `auth.role` vient
+du JWT. Comme je connais le secret, je contrôle le contenu du token et
+l'application n'a aucun moyen de le distinguer d'un vrai.
 
-**Pourquoi ça marche ?** La signature HS256 ne prouve qu'une chose : « celui qui a signé connaissait le secret ». Si le secret est faible/connu, n'importe qui peut signer un payload arbitraire et l'app n'a aucun moyen de le distinguer d'un vrai token.
+Trois mitigations possibles :
 
-**3 mitigations :**
+- Utiliser un vrai secret aléatoire de 256 bits (`openssl rand -base64 32`),
+  impossible à deviner ou à brute-forcer.
+- Faire tourner le secret régulièrement (par exemple tous les 90 jours, ou après
+  un incident), idéalement stocké dans un coffre comme Azure Key Vault.
+- Passer à un algorithme asymétrique (RS256) : la clé privée signe, la clé
+  publique vérifie. Même en récupérant la clé publique, on ne peut pas forger de
+  token.
 
-| Mitigation | Détail |
-|-----------|--------|
-| **Secret fort (256 bits min)** | `openssl rand -base64 32` génère un secret de 256 bits aléatoires. Impossible à brute-forcer en temps humain. |
-| **Rotation du secret** | Changer le `JWT_SECRET` tous les 90 jours (ou après un incident). Les anciens tokens deviennent invalides, forçant une reconnexion. Idéalement via Azure Key Vault avec versioning. |
-| **Algorithme asymétrique (RS256)** | Utiliser RS256 (clé privée pour signer, clé publique pour vérifier) au lieu de HS256. Même si un attaquant obtient la clé publique, il ne peut pas forger de tokens — seul le détenteur de la clé privée peut signer. |
+**Exercice 4.3.2 — Tentative d'accès aux données d'un autre utilisateur**
 
-#### Exercice 4.3.2 — Authorization bypass
+J'ai créé un ticket au nom de `agent@helpdesk.io`, puis essayé de le lire avec le
+token de `user@helpdesk.io` :
 
 ```bash
-TOKEN="<token user@helpdesk.io>"
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3004/api/tickets/<id-ticket-autre-user>
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3004/api/tickets/<id>
 ```
 
-**Test réalisé :** un ticket a été créé au nom de `agent@helpdesk.io`, puis on a tenté de le lire avec le token de `user@helpdesk.io`.
+Réponse : `403 Forbidden`. Sur ce point l'application est correcte. La route
+`GET /api/tickets/[id]` contient bien le contrôle
+`if (auth.role === 'USER' && ticket.authorId !== auth.userId)`. C'est la
+distinction entre authentification (qui es-tu) et autorisation (as-tu le droit).
+Cela dit, ce contrôle reste contournable via la faille précédente : un token
+forgé en ADMIN n'est pas soumis au filtre `role === 'USER'`.
 
-**Résultat :** `403 Forbidden` → `{"error":"Forbidden"}`.
+**Exercice 4.3.3 — Headers de sécurité manquants**
 
-**Sur ce point, l'application est sécurisée.** La route `GET /api/tickets/[id]` contient bien le contrôle `if (auth.role === 'USER' && ticket.authorId !== auth.userId) return 403`. Un USER ne peut pas lire le ticket d'un autre.
+J'ai inspecté les headers de la page d'accueil avec `curl -I http://localhost:3004/`.
+Aucun header de sécurité n'était présent : pas de `Content-Security-Policy`, pas
+de `X-Frame-Options`, pas de `Strict-Transport-Security`, pas de
+`X-Content-Type-Options`, pas de `Referrer-Policy`, pas de `Permissions-Policy`.
+Seul point positif, `X-Powered-By` est absent (désactivé via `poweredByHeader:
+false` dans `next.config.js`).
 
-**Ce qu'on teste :** la différence entre **authentification** (qui es-tu ?) et **autorisation** (as-tu le droit de faire ça ?). Un utilisateur authentifié ne doit pas pouvoir lire les ressources d'un autre — cette vérification doit être faite côté serveur pour chaque requête. Ici elle est présente. À noter : ce contrôle reste néanmoins contournable via la faille 4.3.1, puisqu'un token forgé en `ADMIN` n'est pas soumis au filtre `role === 'USER'`.
+Rôle de chacun :
 
-#### Exercice 4.3.3 — Headers de sécurité manquants
+| Header | Ce qu'il protège |
+|--------|------------------|
+| `Content-Security-Policy` | limite les sources de scripts/styles, contre le XSS |
+| `X-Frame-Options` | empêche d'afficher le site dans une iframe (clickjacking) |
+| `Strict-Transport-Security` | force le HTTPS |
+| `X-Content-Type-Options` | empêche le navigateur de deviner le type de fichier |
+| `Referrer-Policy` | limite les infos envoyées dans le header `Referer` |
+| `Permissions-Policy` | coupe l'accès caméra/micro/géoloc |
 
-**Test réalisé :** `curl -I http://localhost:3004/` — inspection des headers de réponse de la page d'accueil.
-
-**Résultat — tous les headers de sécurité sont absents :**
-
-| Header | Présent ? |
-|--------|-----------|
-| `Content-Security-Policy` | ✗ absent |
-| `X-Frame-Options` | ✗ absent |
-| `Strict-Transport-Security` | ✗ absent |
-| `X-Content-Type-Options` | ✗ absent |
-| `Referrer-Policy` | ✗ absent |
-| `Permissions-Policy` | ✗ absent |
-| `X-Powered-By` | ✓ absent — bon point, désactivé par `poweredByHeader: false` dans `next.config.js` |
-
-**Headers manquants et leur rôle :**
-
-| Header | Rôle | Valeur appliquée |
-|--------|------|--------------------|
-| `Content-Security-Policy` | Empêche XSS en whitelistant les sources de scripts/styles | `default-src 'self'; script-src 'self' 'unsafe-inline'; …` |
-| `X-Frame-Options` | Empêche le clickjacking (l'app dans une `<iframe>` malveillante) | `DENY` |
-| `Strict-Transport-Security` | Force HTTPS, empêche les attaques man-in-the-middle | `max-age=63072000; includeSubDomains; preload` |
-| `X-Content-Type-Options` | Empêche le MIME sniffing (navigateur qui devine le type de fichier) | `nosniff` |
-| `Referrer-Policy` | Contrôle les infos envoyées dans le header `Referer` | `strict-origin-when-cross-origin` |
-| `Permissions-Policy` | Désactive l'accès aux API sensibles du navigateur | `camera=(), microphone=(), geolocation=()` |
-
-**Correction appliquée :** la faille a été corrigée — un middleware Next.js a été créé dans `src/middleware.ts` et l'image Docker rebuildée. Vérification après correction :
-
-```
-$ curl -I http://localhost:3004/
-HTTP/1.1 200 OK
-content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:
-permissions-policy: camera=(), microphone=(), geolocation=()
-referrer-policy: strict-origin-when-cross-origin
-strict-transport-security: max-age=63072000; includeSubDomains; preload
-x-content-type-options: nosniff
-x-frame-options: DENY
-```
-
-Les 6 headers sont désormais présents sur toutes les pages HTML.
-
-**Code du middleware (`src/middleware.ts`) :**
+J'ai corrigé la faille en ajoutant un middleware Next.js (`src/middleware.ts`)
+qui pose ces headers sur toutes les pages, puis j'ai reconstruit l'image. Après
+correction, `curl -I` montre bien les 6 headers.
 
 ```typescript
 import { NextResponse } from 'next/server';
@@ -378,225 +418,285 @@ export const config = {
 };
 ```
 
-> *(Capture à insérer : sortie `curl -I` avant/après correction)*
+*Capture à fournir : `curl -I` avant / après correction.*
 
-### 4.4 Correctif annexe — healthcheck IPv6
+### 4.4 Un bug que j'ai corrigé au passage
 
-Pendant la phase de tests, le conteneur Docker apparaissait en statut `unhealthy`. Cause : la sonde `HEALTHCHECK` interrogeait `http://localhost:3000/...`, or `localhost` résout d'abord en IPv6 (`::1`) dans le conteneur, tandis que le serveur Next.js standalone n'écoute qu'en IPv4 (`0.0.0.0`). La sonde tapait une adresse morte → `Connection refused`.
+Pendant les tests, le conteneur Docker apparaissait tout le temps en statut
+`unhealthy` alors que l'application fonctionnait. J'ai cherché un moment. La
+sonde `HEALTHCHECK` appelait `http://localhost:3000/...`, et dans le conteneur
+`localhost` est résolu d'abord en IPv6 (`::1`). Or le serveur Next.js standalone
+n'écoute qu'en IPv4. La sonde tapait donc une adresse sur laquelle personne
+n'écoutait, d'où le `Connection refused`.
 
-**Correctif :** remplacer `localhost` par `127.0.0.1` dans le `Dockerfile` et le `docker-compose.yml`. Après rebuild, le conteneur passe `healthy`. C'est un point important : sur Azure App Service, un conteneur `unhealthy` est redémarré ou retiré du routage.
+J'ai remplacé `localhost` par `127.0.0.1` dans le `Dockerfile` et le
+`docker-compose.yml`. Après reconstruction, le conteneur passe `healthy`. Ce
+détail compte : sur Azure App Service, un conteneur `unhealthy` se fait
+redémarrer ou retirer du routage.
 
 ---
 
-## ÉTAPE 5 — CI/CD GitHub Actions
+## Étape 5 — Pipeline CI/CD GitHub Actions
 
 ### 5.1 Structure du pipeline
 
-Le fichier `.github/workflows/ci-cd.yml` définit 4 jobs exécutés dans l'ordre :
+Le fichier `.github/workflows/ci-cd.yml` définit 4 jobs qui s'enchaînent :
 
 ```
-push → master/preProd
-         │
-         ▼
-    ┌─────────┐    ┌──────────┐
-    │  test   │    │ security │   (parallèles)
-    └────┬────┘    └────┬─────┘
-         │              │
-         └──────┬───────┘
-                ▼
-           ┌────────┐
-           │ docker │   (nécessite test + security ✓)
-           └────┬───┘
-                ▼
-           ┌────────┐
-           │ deploy │   (uniquement sur master, nécessite docker ✓)
-           └────────┘
+push sur master / preProd
+        │
+   ┌────┴─────┐
+   ▼          ▼
+ test     security      (en parallèle)
+   └────┬─────┘
+        ▼
+     docker              (attend test + security)
+        ▼
+     deploy              (uniquement sur master)
 ```
 
-**Job `test` :** installe Node 20, lance `npm run lint` + `npm run test:coverage`, uploade le rapport en artefact GitHub Actions.
+- **test** : installe Node 20, lance le lint et les tests avec couverture, et
+  publie le rapport en artefact.
+- **security** : `npm audit` et un scan Trivy du système de fichiers, en mode
+  informatif (`continue-on-error`), donc sans bloquer le pipeline.
+- **docker** : construit l'image Docker (avec cache) et la scanne avec Trivy.
+- **deploy** : ne s'exécute que sur `master`.
 
-**Job `security` :** `npm audit` (vulnérabilités npm) + Trivy filesystem scan. `continue-on-error: true` = le job ne bloque pas le pipeline si des vulnérabilités sont trouvées (mode informatif).
+### 5.2 Corrections que j'ai dû faire pour que le pipeline tourne
 
-**Job `docker` :** build l'image Docker avec cache GitHub Actions (pour accélérer les builds suivants), scan Trivy de l'image construite.
+Le workflow fourni ne fonctionnait pas tel quel, j'ai dû régler trois choses.
 
-**Job `deploy` :** conditionné à `github.ref == 'refs/heads/master'` (uniquement sur la branche principale) + tous les secrets Azure configurés.
+**Les branches.** Le déclencheur écoutait `main` et `develop`. Mon dépôt utilise
+`master` et `preProd`. Tel quel, aucun `git push` ne lançait quoi que ce soit.
+J'ai changé le déclencheur en `[master, preProd]` et la condition du job `deploy`
+en `refs/heads/master`.
 
-### 5.2 Corrections nécessaires avant exécution
+**ESLint.** Le projet n'avait aucun fichier de configuration ESLint. Du coup
+`npm run lint` (`next lint`) devenait interactif, il demandait de choisir une
+config — impossible en CI puisqu'il n'y a personne pour répondre. J'ai ajouté un
+fichier `.eslintrc.json` (`extends: next/core-web-vitals`). Maintenant le lint
+se termine proprement avec le code 0 (3 warnings, 0 erreur).
 
-Deux ajustements ont été indispensables pour que le pipeline puisse s'exécuter :
+**Image introuvable par Trivy.** Au premier vrai run, le job `docker` a échoué
+avec `No such image: helpdesk:<sha>`. La raison : `docker/build-push-action`
+utilise Buildx, qui construit l'image dans son propre cache et pas dans le magasin
+d'images du démon Docker. Avec `push: false` et sans `load: true`, l'image
+n'existe nulle part de visible, donc Trivy ne la trouve pas. J'ai ajouté
+`load: true` à l'étape de build pour charger l'image dans le démon.
 
-1. **Branches de déclenchement.** Le workflow fourni écoutait `main`/`develop`, or ce dépôt utilise `master` (branche principale) et `preProd` (branche de travail). Sans correction, un `git push` ne déclenchait **aucun** job. Le déclencheur a été changé en `[master, preProd]`, et la condition du job `deploy` en `refs/heads/master`.
+Avant de pousser, j'ai vérifié en local : `npm run lint` (code 0),
+`npm run test:coverage` (57 tests OK) et `npm run build` (build réussi).
 
-2. **Configuration ESLint manquante.** Le projet n'avait aucun fichier `.eslintrc`. La commande `npm run lint` (`next lint`) devenait alors **interactive** (elle demandait de choisir une config) — ce qui bloque en CI puisqu'aucune entrée clavier n'est possible. Un fichier `.eslintrc.json` (`extends: next/core-web-vitals`) a été ajouté. Résultat : `npm run lint` se termine avec le code 0 (3 warnings, 0 erreur).
+### 5.3 Résultat
 
-3. **Image Docker introuvable par Trivy (job `docker`).** Au premier run, le job `docker` a échoué : `No such image: helpdesk:<sha>`. Cause : `docker/build-push-action` utilise Buildx, qui build l'image dans son propre cache et **non** dans le magasin d'images du démon Docker. Avec `push: false` et sans `load: true`, l'image n'est visible nulle part — Trivy ne peut pas la scanner. Correctif : ajout de `load: true` à l'étape de build, qui charge l'image dans le démon Docker local.
+Après ces corrections, les jobs `test`, `security` et `docker` passent au vert.
 
-Vérifications locales avant push : `npm run lint` → exit 0 ✓ · `npm run test:coverage` → 57 tests OK ✓ · `npm run build` → build réussi ✓.
-
-### 5.3 Résultats
-
-Après les 3 correctifs ci-dessus, le pipeline s'exécute entièrement : les jobs **test**, **security** et **docker** passent au vert sur la branche `preProd`. Le job **deploy** ne s'exécute pas (réservé à `master`), ce qui est le comportement attendu pour cette étape.
-
-> *(Capture à insérer : onglet GitHub Actions avec les jobs test, security, docker en vert)*
+*Capture à fournir : onglet Actions avec les jobs au vert.*
 
 ---
 
-## ÉTAPE 6 — Déploiement Azure for Students
+## Étape 6 — Déploiement sur Azure for Students
 
-**URL publique de l'application déployée : https://helpdesk-mks.azurewebsites.net**
+Application en ligne : **https://helpdesk-mks.azurewebsites.net**
 
 ### 6.1 Installation d'Azure CLI
 
-Azure CLI n'a pas pu être installé via le script officiel `InstallAzureCLIDeb` : le poste tourne sous **Ubuntu 25.10 « Questing »**, une version trop récente pour laquelle Microsoft n'a pas encore publié de paquet apt (le dépôt renvoie `404`). Contournement utilisé : installation dans un environnement Python isolé (`python3 -m venv` + `pip install azure-cli`), méthode d'installation officiellement supportée. Azure CLI 2.86.0 a ainsi été installé sans `sudo`.
+L'installation via le script officiel `InstallAzureCLIDeb` a échoué. Ma machine
+tourne sous Ubuntu 25.10 « Questing », une version trop récente pour laquelle
+Microsoft n'a pas encore publié de paquet apt (le dépôt renvoie une 404). J'ai
+contourné en installant Azure CLI dans un environnement Python isolé
+(`python3 -m venv` puis `pip install azure-cli`), ce qui est une méthode
+officiellement supportée. J'ai obtenu Azure CLI 2.86.0 sans avoir besoin de
+`sudo`.
 
-### 6.2 Ressources créées
+### 6.2 Création des ressources
 
-| Ressource | Nom | SKU / Détail |
-|-----------|-----|--------------|
+| Ressource | Nom | Détail |
+|-----------|-----|--------|
 | Resource Group | `helpdesk-rg` | région `francecentral` |
-| Container Registry | `helpdeskacrmks` | Basic — `helpdeskacrmks.azurecr.io` |
-| App Service Plan | `helpdesk-plan` | B1 (Linux) |
+| Container Registry | `helpdeskacrmks` | SKU Basic |
+| App Service Plan | `helpdesk-plan` | B1 Linux |
 | Web App | `helpdesk-mks` | conteneur Linux |
 
-**Obstacle rencontré :** sur une souscription neuve, les *resource providers* `Microsoft.ContainerRegistry` et `Microsoft.Web` ne sont pas activés. La création de l'ACR échouait avec `MissingSubscriptionRegistration`. Résolu par `az provider register --namespace Microsoft.ContainerRegistry` (et `Microsoft.Web`).
+Premier obstacle : sur une souscription neuve, les *resource providers*
+`Microsoft.ContainerRegistry` et `Microsoft.Web` ne sont pas activés. La création
+de l'ACR échouait avec `MissingSubscriptionRegistration`. Je les ai activés avec
+`az provider register`.
 
-### 6.3 Push de l'image vers ACR
+### 6.3 Envoi de l'image vers l'ACR
 
 ```bash
 docker tag helpdesk:dev helpdeskacrmks.azurecr.io/helpdesk:v1
 docker push helpdeskacrmks.azurecr.io/helpdesk:v1
 ```
 
-L'image a été poussée avec le tag `v1` après authentification (`docker login` avec les credentials admin de l'ACR).
+Après un `docker login` sur l'ACR avec les identifiants admin du registre.
 
 ### 6.4 Création de la Web App
 
-**Obstacle rencontré :** avec les flags récents d'`az webapp create`, passer `--container-image-name` *avec* le host du registre **et** `--container-registry-url` aboutit à un double préfixe (`helpdeskacrmks.azurecr.io/helpdeskacrmks.azurecr.io/helpdesk:v1`). À l'inverse, `az webapp config container set` ne préfixe **pas** : il faut lui passer le chemin **complet**. Configuration finale correcte :
+Là j'ai eu un piège avec `az webapp create`. Si on passe `--container-image-name`
+avec le nom du registre déjà dedans, *et* `--container-registry-url`, la CLI
+préfixe le registre une deuxième fois et on obtient un chemin double
+(`helpdeskacrmks.azurecr.io/helpdeskacrmks.azurecr.io/helpdesk:v1`), qui ne
+correspond à rien. À l'inverse, `az webapp config container set` ne préfixe pas,
+il faut lui donner le chemin complet. J'ai fini avec la bonne configuration :
 
 ```
 linuxFxVersion = DOCKER|helpdeskacrmks.azurecr.io/helpdesk:v1
 ```
 
-Variables d'environnement définies (`az webapp config appsettings set`) :
+Variables d'environnement définies sur la Web App :
 
-| Variable | Valeur | Rôle |
-|----------|--------|------|
-| `DATABASE_URL` | `file:/app/data/prod.db` | Emplacement de la base SQLite |
-| `JWT_SECRET` | (généré par `openssl rand -base64 32`) | Secret de signature JWT — fort, 256 bits |
-| `NODE_ENV` | `production` | Mode production |
-| `WEBSITES_PORT` | `3000` | Indique à Azure le port exposé par le conteneur |
+| Variable | Valeur |
+|----------|--------|
+| `DATABASE_URL` | `file:/app/data/prod.db` |
+| `JWT_SECRET` | un secret généré avec `openssl rand -base64 32` |
+| `NODE_ENV` | `production` |
+| `WEBSITES_PORT` | `3000` |
 
 ### 6.5 Initialisation de la base de données
 
-Le TP prévoyait d'initialiser la base via SSH (`az webapp ssh` puis `npx prisma migrate deploy`). **Cette approche ne fonctionne pas ici** : l'image standalone ne contient ni le CLI Prisma ni `tsx`, et `npx prisma` télécharge alors Prisma 7 qui rejette le schéma écrit pour Prisma 5.
+Le TP prévoyait d'initialiser la base via SSH dans le conteneur
+(`npx prisma migrate deploy`). Ça ne marche pas ici : l'image standalone ne
+contient ni le CLI Prisma ni `tsx`, et `npx prisma` télécharge alors la version 7
+de Prisma, qui refuse le schéma écrit pour la version 5.
 
-**Solution retenue :** la base est créée et seedée **pendant le build Docker**, dans le stage `builder` (qui dispose, lui, du CLI Prisma 5 et de `tsx` via les devDependencies). La base SQLite pré-remplie (3 utilisateurs : admin / agent / user) est ensuite copiée dans l'image finale à `/app/data/prod.db`. L'application est donc opérationnelle dès le démarrage du conteneur, sans étape manuelle.
+J'ai donc choisi une autre approche : créer et seeder la base **pendant le build
+Docker**, dans l'étape `builder`, qui dispose elle du CLI Prisma 5 et de `tsx`.
+La base SQLite déjà remplie (les 3 utilisateurs de démo) est copiée dans l'image
+finale à `/app/data/prod.db`. L'application est donc prête dès le démarrage du
+conteneur, sans manipulation.
 
-*Limite assumée :* la base étant embarquée dans l'image, elle revient à son état seedé à chaque redéploiement. Pour une vraie persistance, il faudrait une base externe (cf. synthèse — migration PostgreSQL).
+Limite que j'assume : comme la base est dans l'image, elle revient à son état de
+départ à chaque redéploiement. Pour une vraie persistance il faudrait une base
+externe (voir la synthèse).
 
-### 6.6 Validation
+### 6.6 Vérification
 
-```
+```bash
 $ curl https://helpdesk-mks.azurewebsites.net/api/health
-{"status":"ok","timestamp":"2026-05-22T14:33:46.232Z","uptime":7.0}
-
-$ curl -X POST https://helpdesk-mks.azurewebsites.net/api/auth/login \
-    -d '{"email":"admin@helpdesk.io","password":"Password123!"}'
-→ connexion réussie, role: ADMIN (Alice Admin)
+{"status":"ok","timestamp":"...","uptime":...}
 ```
 
-Les 6 headers de sécurité (middleware) sont également présents sur la réponse HTTPS. L'application est accessible publiquement et fonctionnelle.
+La connexion fonctionne (compte admin, rôle ADMIN), et les 6 headers de sécurité
+sont bien présents sur la réponse HTTPS. L'application est publique et
+fonctionnelle.
 
-> *(Captures à insérer : `curl .../api/health` + navigateur sur https://helpdesk-mks.azurewebsites.net avec le dashboard connecté)*
+*Captures à fournir : `curl /api/health` + le dashboard dans le navigateur.*
 
 ### 6.7 Connexion de la CI au déploiement (bonus)
 
-Le TP prévoyait d'authentifier GitHub Actions via un *service principal* (`az ad sp create-for-rbac`). **Impossible ici** : le compte Azure for Students renvoie `Insufficient privileges to complete the operation` — le tenant Entra ID de l'école interdit aux étudiants de créer des applications/identités d'annuaire.
+C'est l'étape qui m'a demandé le plus de débogage, parce que je n'ai pas pu
+suivre la méthode du TP.
 
-**Alternative retenue — le publish profile.** C'est un identifiant propre à la Web App, téléchargeable sans aucun droit d'annuaire (`az webapp deployment list-publishing-profiles`). Le job `deploy` du workflow a été adapté en conséquence :
+**Pas de service principal.** Le TP voulait authentifier GitHub Actions avec un
+service principal créé par `az ad sp create-for-rbac`. La commande échoue :
+`Insufficient privileges to complete the operation`. Le tenant Entra ID de
+l'école interdit aux comptes étudiants de créer des identités d'annuaire.
 
-- suppression de l'étape `azure/login` (qui exigeait le service principal) ;
-- ajout du paramètre `publish-profile` à l'action `azure/webapps-deploy` ;
-- l'authentification ACR (`azure/docker-login`) est conservée — elle utilise les identifiants admin du registre, qui ne demandent pas de droits d'annuaire.
+**Le publish profile ne suffit pas pour un conteneur.** J'ai d'abord essayé de
+contourner avec un *publish profile* passé à `azure/webapps-deploy`. Le job a
+quand même échoué à cette étape. En cherchant, j'ai compris : un publish profile
+donne accès au endpoint SCM/Kudu, qui sert à déployer du *code*, mais changer
+l'*image* d'un conteneur est une opération ARM, que le publish profile ne couvre
+pas.
 
-**Secrets GitHub configurés** (Settings → Secrets and variables → Actions) :
+**Solution finale : déploiement continu par webhook.** L'idée est que la CI n'a
+plus du tout besoin de droits sur Azure, juste de pouvoir pousser sur l'ACR :
 
-| Secret | Contenu |
-|--------|---------|
-| `ACR_LOGIN_SERVER` | `helpdeskacrmks.azurecr.io` |
-| `ACR_USERNAME` | `helpdeskacrmks` |
-| `ACR_PASSWORD` | mot de passe admin de l'ACR |
-| `AZURE_WEBAPP_NAME` | `helpdesk-mks` |
-| `AZURE_WEBAPP_PUBLISH_PROFILE` | profil de publication XML de la Web App |
+1. La Web App est configurée pour surveiller le tag `helpdesk:latest`, et
+   j'active le déploiement continu (`az webapp deployment container config
+   --enable-cd true`), ce qui me donne une URL de webhook.
+2. Je crée un webhook sur l'ACR (`az acr webhook create`, limité au tag
+   `helpdesk:latest`) : à chaque push de ce tag, l'ACR appelle l'URL de la
+   Web App.
+3. Le job `deploy` se limite donc à : se connecter à l'ACR, construire l'image,
+   pousser les tags `:latest` et `:<sha>`. Le push de `:latest` déclenche le
+   webhook, et la Web App va chercher la nouvelle image toute seule.
+4. Un dernier *smoke test* vérifie que `/api/health` répond bien.
 
-Une fois les secrets en place, un `push` sur `master` déclenche les 4 jobs, dont `deploy` qui rebuild l'image, la pousse sur l'ACR (taggée avec le SHA du commit) et met à jour la Web App.
+Un détail au passage : le webhook renvoyait d'abord `401 Unauthorized`.
+L'authentification basique du endpoint SCM était désactivée sur la Web App, je
+l'ai réactivée et le webhook a ensuite renvoyé `202 Accepted`.
 
-> *(Capture à insérer : onglet GitHub Actions avec les 4 jobs — dont deploy — en vert)*
+Secrets configurés dans GitHub (Settings → Secrets and variables → Actions) :
+`ACR_LOGIN_SERVER`, `ACR_USERNAME`, `ACR_PASSWORD` et `AZURE_WEBAPP_NAME`.
+
+Un push sur `master` déclenche bien les 4 jobs, `deploy` compris.
+
+*Capture à fournir : onglet Actions avec les 4 jobs au vert.*
 
 ---
 
-## Synthèse finale
+## Synthèse
 
 ### Architecture finale
 
 ```
- ┌──────────────────────────────────────────────────────────────────────┐
- │  Développeur local                                                    │
- │                                                                      │
- │  Code source  →  git push  →  GitHub (branches master / preProd)     │
- └─────────────────────────────┬────────────────────────────────────────┘
-                                │ déclenche
-                                ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │  GitHub Actions CI/CD Pipeline                                       │
- │                                                                      │
- │  [test] lint + unit tests + coverage                                 │
- │  [security] npm audit + Trivy scan                                   │
- │  [docker] build image Docker + scan image                            │
- │  [deploy] push ACR + deploy App Service  (sur master uniquement)     │
- └──────────────────────────────┬───────────────────────────────────────┘
-                                 │
-               ┌─────────────────┴──────────────────┐
-               ▼                                    ▼
- ┌─────────────────────────┐          ┌──────────────────────────────┐
- │  Azure Container        │          │  Azure App Service            │
- │  Registry (ACR)         │ ─pull──▶ │  helpdesk-mks                 │
- │  helpdeskacrmks         │          │  (container Linux, plan B1)   │
- │  helpdesk:v1            │          │                               │
- └─────────────────────────┘          └──────────────────────────────┘
-                                                   │
-                                                   ▼
-                          https://helpdesk-mks.azurewebsites.net
-                                       (accès public)
+ Développeur
+   │  git push
+   ▼
+ GitHub  (branches master / preProd)
+   │  déclenche
+   ▼
+ GitHub Actions
+   ├─ test      : lint + tests unitaires + couverture
+   ├─ security  : npm audit + scan Trivy
+   ├─ docker    : build image + scan Trivy
+   └─ deploy    : build + push image  (master uniquement)
+                       │
+                       ▼
+            Azure Container Registry (helpdeskacrmks)
+                       │  webhook sur push de :latest
+                       ▼
+            Azure App Service (helpdesk-mks, plan B1)
+                       │
+                       ▼
+            https://helpdesk-mks.azurewebsites.net
 ```
 
-### 3 améliorations DevSecOps prioritaires
+### Trois améliorations DevSecOps que je mettrais en place avec plus de temps
 
-1. **Azure Key Vault pour les secrets**  
-   Actuellement, `JWT_SECRET` et les credentials ACR sont dans des GitHub Secrets et des App Settings Azure en clair. Azure Key Vault chiffrerait ces secrets et permettrait une rotation sans redéploiement. L'app lirait les secrets via une Managed Identity (pas de credentials à gérer).
+1. **Azure Key Vault pour les secrets.** Aujourd'hui le `JWT_SECRET` et les
+   identifiants de l'ACR sont dans des secrets GitHub et des app settings Azure
+   en clair. Un coffre comme Key Vault les chiffrerait, permettrait de les faire
+   tourner sans redéployer, et l'application les lirait via une identité managée
+   sans avoir à gérer de credentials.
 
-2. **Monitoring avec Application Insights**  
-   Actuellement, aucune observabilité en production : on ne sait pas combien d'erreurs 500 se produisent ni quelles routes sont lentes. Application Insights instrumenterait automatiquement Next.js (traces distribuées, alertes sur le taux d'erreur, dashboard de performance en temps réel).
+2. **Monitoring avec Application Insights.** Pour l'instant je n'ai aucune
+   visibilité en production : je ne sais pas combien d'erreurs 500 se produisent
+   ni quelles routes sont lentes. Application Insights instrumenterait
+   l'application et donnerait des traces, des alertes sur le taux d'erreur et un
+   tableau de bord de performance.
 
-3. **Migration vers PostgreSQL (Azure Database for PostgreSQL)**  
-   SQLite est parfait en développement mais est mono-écriture : lors du test de charge à 200 VUs, les writes se sérialisent et créent un goulot d'étranglement. PostgreSQL gère la concurrence et permettrait de scaler horizontalement l'App Service (plusieurs instances).
+3. **Passage à PostgreSQL.** SQLite convient en développement mais le test de
+   charge a bien montré sa limite : une seule écriture à la fois. Une base
+   PostgreSQL (Azure Database for PostgreSQL) gérerait la concurrence et
+   permettrait de faire tourner plusieurs instances de l'App Service.
 
-### Coût Azure estimé
+### Coût Azure
 
-Deux ressources facturées : **ACR Basic** (~5 $/mois) + **App Service Plan B1** (~13 $/mois) = **~18 $/mois**. Le resource group et la Web App ne coûtent rien en eux-mêmes (la facturation se fait sur le plan). Sur les 100 $ de crédit Azure for Students, le déploiement couvre donc environ **5 mois**. Le déploiement de ce TP, sur quelques heures, n'entame le crédit que de quelques centimes.
+Deux ressources sont facturées : l'ACR Basic (environ 5 $/mois) et l'App Service
+Plan B1 (environ 13 $/mois), soit à peu près 18 $/mois. Le resource group et la
+Web App ne coûtent rien en eux-mêmes. Sur les 100 $ de crédit Azure for Students,
+ça tient environ 5 mois. Le déploiement réalisé pour ce TP, sur quelques heures,
+n'a entamé le crédit que de quelques centimes.
 
-> *(Capture à insérer : Azure Cost Management — coût réel constaté)*
+*Capture à fournir : coût réel dans Azure Cost Management.*
 
-### Ce qui a posé problème
+### Ce qui m'a posé problème
 
 | Problème | Cause | Solution |
 |----------|-------|----------|
-| Conteneur `unhealthy` en local | `localhost` résout en IPv6 dans le conteneur, le serveur Next.js n'écoute qu'en IPv4 | `localhost` → `127.0.0.1` dans le healthcheck |
-| Login impossible en conteneur | Connexion Prisma mise en cache avant l'arrivée de la base | Redémarrer le conteneur après l'init de la base |
-| `next lint` bloquant en CI | Aucune config ESLint → commande interactive | Ajout de `.eslintrc.json` |
-| Workflow CI jamais déclenché | Le workflow écoutait `main`/`develop`, dépôt sur `master`/`preProd` | Correction des branches du déclencheur |
-| Job `docker` : image introuvable par Trivy | Buildx ne charge pas l'image dans le démon Docker | Ajout de `load: true` |
-| Azure : `MissingSubscriptionRegistration` | Resource providers non activés sur une souscription neuve | `az provider register` (ContainerRegistry, Web) |
-| Azure : image au mauvais chemin | Double préfixe du registre par `az webapp create` | Chemin d'image complet via `az webapp config container set` |
-| Azure : base de données non initialisable | L'image standalone n'a ni le CLI Prisma ni `tsx` | Base SQLite seedée pendant le build, embarquée dans l'image |
-| Azure CLI non installable | Ubuntu 25.10 trop récent, pas de paquet Microsoft | Installation via `pip` dans un venv Python |
+| Conteneur `unhealthy` | `localhost` résolu en IPv6, serveur en IPv4 | `localhost` → `127.0.0.1` dans le healthcheck |
+| Login en erreur dans le conteneur | connexion Prisma mise en cache avant la base | redémarrer le conteneur |
+| `next lint` bloquant en CI | pas de config ESLint, commande interactive | ajout de `.eslintrc.json` |
+| Workflow jamais déclenché | écoutait `main`/`develop`, dépôt en `master`/`preProd` | correction des branches |
+| Trivy ne trouve pas l'image | Buildx ne charge pas l'image dans le démon | `load: true` à l'étape de build |
+| `MissingSubscriptionRegistration` | resource providers non activés | `az provider register` |
+| Chemin d'image Azure doublé | double préfixe du registre par `az webapp create` | chemin complet via `config container set` |
+| Base non initialisable sur Azure | l'image standalone n'a ni Prisma CLI ni `tsx` | base seedée pendant le build, embarquée |
+| Azure CLI non installable | Ubuntu 25.10 trop récent | installation via `pip` dans un venv |
+| Pas de service principal | tenant Entra ID restreint | déploiement continu par webhook ACR |
+| `azure/webapps-deploy` en échec | le publish profile ne couvre pas l'ARM | webhook ACR, la Web App re-pull seule |
+| Webhook en `401` | auth basique SCM désactivée | réactivation de `basicPublishingCredentialsPolicies` |
